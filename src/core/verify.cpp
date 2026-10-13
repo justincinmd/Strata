@@ -3185,12 +3185,13 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
 }
 
-bool Verifier::capture_all(std::string& err) {
+bool Verifier::capture_all(std::string& err, int upto) {
     const OnDevice on_device(device_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
-    for (int T = 1; T <= max_t_; ++T)
+    const int top = upto > 0 ? std::min(upto, max_t_) : max_t_;
+    for (int T = 1; T <= top; ++T)
         if (!capture(T, err)) return false;
     if (!capture_commit(err)) return false;
     if ((ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) ||
@@ -3205,6 +3206,19 @@ bool Verifier::capture_all(std::string& err) {
     }
     pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
     return true;
+}
+
+bool Verifier::capture_doorbell(std::string& err, int upto) {
+    const OnDevice on_device(device_);
+    if (g_ == nullptr) { err = "verify: capture_doorbell before init"; return false; }
+    if (!all_resident_) return true;
+    const bool keep = ar_off_;
+    ar_off_ = true;   // capture() and record_window() pick the doorbell variant from it
+    bool ok = true;
+    const int top = upto > 0 ? std::min(upto, max_t_) : max_t_;
+    for (int T = 1; T <= top && ok; ++T) ok = capture(T, err);
+    ar_off_ = keep;
+    return ok;
 }
 
 // The host staging of a pipelined window: run()'s (stage_inputs), and its PLE rows from `ple_prev` with their pages
@@ -3443,6 +3457,15 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
+    return true;
+}
+
+bool Verifier::pl_wait_commit(std::string& err) {
+    if (!commit_live_ || ev_commit_ == nullptr) return true;
+    const OnDevice on_device(device_);
+    const cudaError_t se = cudaEventSynchronize(ev_commit_);
+    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    commit_live_ = false;
     return true;
 }
 

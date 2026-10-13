@@ -254,7 +254,20 @@ public:
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
-    bool capture_all(std::string& err);
+    /// `upto` > 0 (--lanes): only the window sizes 1..upto.
+    bool capture_all(std::string& err, int upto = 0);
+    /// --lanes: also capture the doorbell variant of every window size now (exec_nr_, the graph a stage that
+    /// is all-resident runs while a prompt loan / shrink / swap has experts out of VRAM).  Nothing when the stage was not
+    /// all-resident at init (its windows are doorbell graphs already).  Never with a window in flight.
+    bool capture_doorbell(std::string& err, int upto = 0);
+    /// 100% of this stage's experts were resident at init: its windows run the zero-doorbell graph.
+    bool all_resident() const { return all_resident_; }
+    /// --lanes: re-reads the residency table (as run() does before a window) and says whether the next
+    /// window runs the zero-doorbell graph - the only one `pl_launch` launches.  False during a prompt loan / swap.
+    bool resident_now() { refresh_ar(); return ar_on(); }
+    /// --lanes: waits for the last `pl_commit_async` graph (pl_commit_async never sets what wait_commit
+    /// reads).  Free when none is live.
+    bool pl_wait_commit(std::string& err);
     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and

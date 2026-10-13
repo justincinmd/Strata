@@ -429,6 +429,22 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
     cudaGetLastError();
 #endif
+    // --lanes (opt-in: set_high_priority): the lane drafters' streams at the highest priority, HIP included - the draft
+    // runs beside the other lane's stage-1 window on the same card, and the next stage-0 launch waits for it
+    if (!prio && hi_prio_) {
+        int lo = 0, hi = 0;
+#if defined(STRATA_USE_HIP)
+        prio = hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess &&
+               hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi) == hipSuccess;
+        (void) hipGetLastError();
+#else
+        prio = cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+               cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, hi) == cudaSuccess;
+        cudaGetLastError();
+#endif
+        std::fprintf(stderr, "strata mtp: the drafter's stream at priority %d (range %d..%d)%s\n", hi, lo, hi,
+                     prio ? "" : ": FAILED, the default priority");
+    }
     if (!prio && cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
 #if !defined(STRATA_USE_HIP)
     // HIP keeps the shared expert on cs_; only CUDA needs this branch stream.
@@ -1258,6 +1274,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+    if (dl_live_) { err = "mtp: a polled draft (draft_begin) is still in flight"; return false; }   // (--lanes)
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
@@ -1269,27 +1286,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();
-    const int64_t NH = g_->n_head;
-    auto put = [&](int row, int64_t cell) {
-        h_step_[row * 4 + 0] = (int32_t) cell;
-        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
-        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
-        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
-    };
-    for (int t = 0; t < T; ++t) {
-        h_tok_[t] = tokens[t];
-        put(t, p + t);
-    }
-    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
-    for (int j = 1; j < max_steps; ++j)
-        put(max_t_ + j - 1, coupled_draft_cell(p, a, j));
-    for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
-    h_row_[0] = a;
-    h_row_[1] = 0;
-    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!stage_source_R(T, err)) return false;
+    if (!stage_round(T, tokens, p, a, max_steps, err)) return false;
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
@@ -1385,6 +1382,149 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     return true;
 }
 
+// draft()'s staging (also draft_begin's): the round's tokens, step records and positions, every step's cell, the
+// outputs reset to -1, the selected row, the forcing words off, and the source rows
+bool MtpDrafter::stage_round(int T, const int32_t* tokens, int64_t p, int a, int max_steps, std::string& err) {
+    const int64_t NH = g_->n_head;
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        put(t, p + t);
+    }
+    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
+    for (int j = 1; j < max_steps; ++j)
+        put(max_t_ + j - 1, coupled_draft_cell(p, a, j));
+    for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
+    h_row_[0] = a;
+    h_row_[1] = 0;
+    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return stage_source_R(T, err);
+}
+
+// --lanes: draft() split so the host never waits in it.  draft() reads output j once it is >= 0 (or the
+// stream has finished), launches step j + 1 after reading output j while its probability is >= min_p (all steps at once
+// without min_p), and returns after a stream sync; this does the same from polls.
+bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, float min_p, std::string& err) {
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (chain_live_ || dl_live_) { err = "mtp: a draft is still in flight"; return false; }
+    if (!mtp_catchup_all()) T = a + 1;   // as draft()
+    const bool cp = coupled_active_;
+    if (!capture_round(T, cp, err)) return false;
+    // as draft(): near the context's end the round drafts only the cells its K/V has
+    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
+    if (max_steps > 16) { err = "mtp: draft_begin takes at most 16 drafts"; return false; }
+    for (int j = 1; j < max_steps; ++j)
+        if (!capture_step(j, cp, err)) return false;
+    dl_t0_ms_ = std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+    if (!stage_round(T, tokens, p, a, max_steps, err)) return false;
+    SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
+    dl_ple_ = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
+    dl_prev_[0] = dl_ple_ ? pss->ple_prev[0] : 0;
+    dl_prev_[1] = dl_ple_ ? pss->ple_prev[1] : 0;
+    dl_cp_ = cp;
+    dl_steps_ = max_steps;
+    dl_minp_ = min_p;
+    dl_n_ = 0;
+    dl_spins_ = 0;
+    dl_launched_ = 0;
+    if (max_steps > 0) {
+        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        dl_launched_ = 1;
+        for (int j = 1; min_p <= 0.0f && j < max_steps; ++j) {
+            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            dl_launched_ = j + 1;
+        }
+        (void) cudaStreamQuery(cs_);
+    }
+    dl_live_ = true;
+    // the PLE pages of the tokens the next window reads (draft()'s prefetch_ple): the last accepted pick first
+    if (dl_ple_ && max_steps > 0 && tokens[a] >= 0) {
+        uint32_t rows16[strata::kernels::PLE_N_HEADS];
+        strata::kernels::ngram_rows(&tokens[a], dl_prev_, 1, pss->ple.consts, rows16);
+        dl_prev_[0] = dl_prev_[1];
+        dl_prev_[1] = tokens[a];
+        pss->ple.table->prefetch_rows(rows16);
+    }
+    return true;
+}
+
+int MtpDrafter::draft_poll(int32_t* drafts, float* probs, int* n_drafts, std::string& err) {
+    if (!dl_live_) { err = "mtp: no draft in flight"; return -1; }
+    const OnDevice on_device(device_);
+    SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
+    auto stream_state = [&]() -> int {   // 1 finished, 0 running, -1 failed
+        const cudaError_t q = cudaStreamQuery(cs_);
+        if (q == cudaErrorNotReady) return 0;
+        if (q != cudaSuccess) {
+            dl_live_ = false;
+            err = std::string("mtp draft: ") + cudaGetErrorString(q);
+            return -1;
+        }
+        return 1;
+    };
+    for (;;) {
+        if (dl_n_ < dl_launched_) {   // an output launched and not read yet
+            int32_t d = ((volatile int32_t*) h_out_)[dl_n_];
+            if (d < 0) {
+                if ((++dl_spins_ & 15u) != 0) return 0;   // the driver is asked every 16th poll (draft(): every 1024th spin)
+                const int s = stream_state();
+                if (s <= 0) return s;
+                d = ((volatile int32_t*) h_out_)[dl_n_];   // the stream has finished: what is there (as draft())
+            }
+            dl_tok_[dl_n_] = d;
+            dl_prob_[dl_n_] = ((volatile float*) h_prob_)[dl_n_];
+            if (dl_ple_ && d >= 0 && pss != nullptr) {
+                uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                strata::kernels::ngram_rows(&d, dl_prev_, 1, pss->ple.consts, rows16);
+                dl_prev_[0] = dl_prev_[1];
+                dl_prev_[1] = d;
+                pss->ple.table->prefetch_rows(rows16);
+            }
+            ++dl_n_;
+            continue;
+        }
+        // every launched output is read: min_p goes on while the last draft is likely enough (draft()'s loop)
+        if (dl_minp_ > 0.0f && dl_n_ >= 1 && dl_n_ < dl_steps_ && dl_prob_[dl_n_ - 1] >= dl_minp_) {
+            if (cudaGraphLaunch(dl_cp_ ? step_exec_c_[dl_n_] : step_exec_[dl_n_], cs_) != cudaSuccess) {
+                dl_live_ = false;
+                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                return -1;
+            }
+            (void) cudaStreamQuery(cs_);
+            dl_launched_ = dl_n_ + 1;
+            return 0;
+        }
+        break;
+    }
+    const int s = stream_state();   // draft()'s closing stream sync
+    if (s <= 0) return s;
+    const int n = dl_n_;
+    for (int j = 0; j < n; ++j) {
+        drafts[j] = dl_tok_[j];
+        if (probs) probs[j] = dl_prob_[j];
+    }
+    for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
+    if (n_drafts) *n_drafts = n;
+    dl_live_ = false;
+    ms_draft += std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count() - dl_t0_ms_;
+    ++rounds;
+    return 1;
+}
+
 bool MtpDrafter::stage_source_R(int T, std::string& err) {
     if (src_R_ == nullptr || src_R_ == window_R_) return true;
     if (cudaMemcpyAsync((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
@@ -1411,6 +1551,18 @@ bool MtpDrafter::prepare_chain(std::string& err) {
             err = "mtp: event creation failed";
             return false;
         }
+    return true;
+}
+
+bool MtpDrafter::prepare_draft(std::string& err, int upto) {
+    const OnDevice on_device(device_);
+    if (window_R_ == nullptr) { err = "mtp: prepare_draft before bind"; return false; }
+    const int top = upto > 0 ? std::min(upto, max_t_) : max_t_;
+    for (int T = 1; T <= top; ++T)
+        if (!capture_round(T, false, err)) return false;
+    const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    for (int j = 1; j < max_steps; ++j)
+        if (!capture_step(j, false, err)) return false;
     return true;
 }
 

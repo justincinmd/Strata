@@ -128,6 +128,20 @@ public:
     void set_source_R(const float* rows) { src_R_ = rows; }
     /// Capture the round graphs for T = 1..max_t and every step graph now (a capture syncs the drafter's stream).
     bool prepare_chain(std::string& err);
+    /// --lanes: capture the plain draft() graphs now - the round for T = 1..max_t and the steps up to the
+    /// draft count - so no capture runs (and no VRAM is taken) at the first draft.  After bind.
+    bool prepare_draft(std::string& err, int upto = 0);   ///< `upto` > 0: rounds of 1..upto rows only
+    /// --lanes: draft() without holding the host.  `draft_begin` stages and launches the round
+    /// (and, without min_p, every step); `draft_poll` reads the outputs as they land, launches the next step while the
+    /// last draft's probability is >= min_p, and returns 1 once draft() would have returned (`drafts`/`probs`/`n_drafts`
+    /// as draft() fills them), 0 while the drafter's stream still runs, -1 on an error.  The same graphs in the same
+    /// order on the same stream as draft(), so the drafts are draft()'s; only the host's waiting differs.
+    bool draft_begin(int T, const int32_t* tokens, int64_t p, int a, float min_p, std::string& err);
+    int draft_poll(int32_t* drafts, float* probs, int* n_drafts, std::string& err);
+    bool draft_live() const { return dl_live_; }
+    /// --lanes (opt-in, STRATA_LANES_DRAFT_PRIO=1; before `load`): the drafter's stream at the device's highest
+    /// priority, also on HIP (where it gets a hardware queue of its own instead of sharing one with a window stream).
+    void set_high_priority(bool on) { hi_prio_ = on; }
     /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
     /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
@@ -222,6 +236,17 @@ private:
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
+    // --lanes: draft_begin / draft_poll
+    bool stage_round(int T, const int32_t* tokens, int64_t p, int a, int max_steps, std::string& err);   ///< draft()'s staging
+    bool hi_prio_ = false;
+    bool dl_live_ = false, dl_cp_ = false, dl_ple_ = false;
+    int dl_steps_ = 0, dl_launched_ = 0, dl_n_ = 0;
+    uint32_t dl_spins_ = 0;
+    float dl_minp_ = 0.0f;
+    int32_t dl_prev_[2] = {0, 0};
+    int32_t dl_tok_[16] = {};
+    float dl_prob_[16] = {};
+    double dl_t0_ms_ = 0;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
