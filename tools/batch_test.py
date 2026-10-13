@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """Batching test: the same prompts decoded alone (GEN, the usual path with drafts) and together in the batch
 windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints the aggregate decode rate.
-The same test covers the dual lanes (--batch 2 --lanes 2, or a config with "lanes": 2: each slot decodes as a solo request).
 
   python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 4 --n 4 \
       --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
+
+The same test covers the dual lanes (docs/BATCHING.md "Dual lanes"): each slot then decodes as a solo request.  The
+lanes are asked for by a config with "lanes": 2 (as the server), by --lanes 2 in --extra, or by --env STRATA_LANES=2.
+Then --batch and --n default to 2, and the test fails (exit 3) unless the engine's INFO line says lanes=2 (an engine
+that turns the lanes off says why in its log: "WARNING: --lanes is off: ...").  For a two-GPU config:
+
+  python3 tools/batch_test.py --exe build/strata --config strata-<model>-lanes.json --config-env --max-new 1000 \
+      --extra "--no-prefill-borrow --pcie-frac 0 --adapt-every 1000000 --kv-resident 32768"
+
+(--no-prefill-borrow holds back more VRAM on the later stage; on 2x 32 GB cards --kv-resident 32768 keeps every expert
+resident, which the pipelined lanes need: the log's "strata lanes: GO" line.)  In every mode the prompt count must not
+exceed the engine's batch_slots.
 """
 import argparse, json, os, subprocess, sys, tempfile, threading, time
 from pathlib import Path
@@ -53,7 +64,10 @@ class Engine:
         self.log = open(self.log_path, "w")
         self.p = subprocess.Popen([exe, "--serve", *args], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=self.log, text=True, bufsize=1, env=env)
+        self.info = {}      # the INFO line's key=value fields (batch_slots, batch_groups, lanes, ...)
         for line in self.p.stdout:
+            if line.startswith("INFO "):
+                self.info.update(kv.split("=", 1) for kv in line.split()[1:] if "=" in kv)
             if line.startswith("READY"):
                 return
         raise SystemExit(f"the engine ended before READY - see {self.log_path}")
@@ -71,8 +85,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
     ap.add_argument("--config", required=True)
-    ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--n", type=int, default=4, help="prompts (<= --batch)")
+    ap.add_argument("--batch", type=int, default=None, help="batch slots (default 4; 2 when the lanes are asked for)")
+    ap.add_argument("--n", type=int, default=None,
+                    help="prompts (default: --batch; at most the engine's batch_slots, which the test checks)")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--skip-solo", action="store_true")
     ap.add_argument("--keys", default="", help='sampling keys for every request, e.g. "temperature=0.7 top_k=20"')
@@ -89,6 +104,31 @@ def main():
                     help="one more engine environment variable (repeatable), e.g. --env STRATA_LANES=2 for the dual lanes")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
+    env = {}
+    if a.config_env:
+        env.update({k: str(v) for k, v in (cfg.get("env") or {}).items()})
+    for kv in a.env:
+        k, _, v = kv.partition("=")
+        env[k] = v
+    # the dual lanes are asked for (as the engine reads it: --lanes N or STRATA_LANES=N, N >= 2; the config's "lanes": 2)
+    extra = a.extra.split()
+    def as_int(x):
+        try:
+            return int(x)
+        except (TypeError, ValueError):
+            return 0
+    lanes_flag = max([as_int(extra[i + 1]) for i, x in enumerate(extra[:-1]) if x == "--lanes"] or [0])
+    lanes_env = as_int(env.get("STRATA_LANES", os.environ.get("STRATA_LANES")))
+    want_lanes = cfg.get("lanes") == 2 or lanes_flag >= 2 or lanes_env >= 2
+    if a.batch is None:
+        a.batch = 2 if want_lanes else 4
+    if a.n is None:
+        a.n = a.batch
+    if want_lanes and (a.batch != 2 or a.n > 2):
+        raise SystemExit(f"lanes: two slots, one request per lane - run with --batch 2 --n 2 (got --batch {a.batch} "
+                         f"--n {a.n})")
+    if a.n > a.batch or a.n > len(QUESTIONS):
+        raise SystemExit(f"--n {a.n}: at most --batch ({a.batch}) and {len(QUESTIONS)} prompts")
     tok = tokenizer(cfg["tokenizer"])
     prompts = []
     for q in QUESTIONS[: a.n]:
@@ -100,17 +140,25 @@ def main():
             filler = "".join(para % i for i in range(a.long_tokens // per + 1))
             text = f"<|im_start|>user\n{filler}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         prompts.append(tok.encode(text, parse_special=True))
-    env = {}
-    if a.config_env:
-        env.update({k: str(v) for k, v in (cfg.get("env") or {}).items()})
-    for kv in a.env:
-        k, _, v = kv.partition("=")
-        env[k] = v
     env.update({"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})})
     if a.mt_min:
         env["STRATA_IQ_MT_MIN"] = a.mt_min
-    eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())
+    eng = Engine(a.exe, cfg, a.batch, env, extra)
     out = eng.lines()
+
+    def refuse(why):
+        print(f"FAILED: {why} (engine log: {eng.log_path})", flush=True)
+        eng.send("QUIT")
+        eng.p.wait(timeout=180)
+        return 3
+    slots = as_int(eng.info.get("batch_slots"))
+    print(f"engine: batch_slots={slots} batch_groups={eng.info.get('batch_groups', '-')} "
+          f"lanes={eng.info.get('lanes', '0')}", flush=True)
+    if len(prompts) > slots:
+        return refuse(f"{len(prompts)} prompts but the engine runs {slots} batch slots (INFO batch_slots)")
+    if want_lanes and eng.info.get("lanes") != "2":
+        return refuse("the lanes were asked for but the engine's INFO line has no lanes=2: it turned them off "
+                      "(see its \"WARNING: --lanes is off\" line)")
 
     solo = []
     if not a.skip_solo:

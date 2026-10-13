@@ -3436,6 +3436,12 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
+    // a one-token window that advanced the state itself (record_window's self_commit) must not be committed again:
+    // pipelined callers turn that off with set_always_publish before init
+    if (last_t_ == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit()) {
+        err = "verify: pipelined commit after a self-committed one-token window (set_always_publish before init)";
+        return false;
+    }
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
         cudaError_t q;

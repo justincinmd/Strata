@@ -288,28 +288,61 @@ How it combines with the other batch switches:
 
 Engine switches (A/B and diagnostics): `STRATA_LANES_SERIAL=1` runs the lanes' windows one after the other (no
 pipelining); `STRATA_LANES_DRAFT_SYNC=1` drafts with the blocking `draft()` inside the pump;
-`STRATA_LANES_DRAFT_PRIO=1` creates the lane drafters' streams at the highest priority (slower on 2x R9700);
-`STRATA_LANES_PRECAPTURE_NR=0` leaves the doorbell graphs to their first use instead of capturing them at start-up.
+`STRATA_LANES_DRAFT_PRIO=1` creates the lane drafters' streams at the highest priority (slower on 2x R9700 in an
+earlier 0.1.40.2-based build of this code); `STRATA_LANES_PRECAPTURE_NR=0` leaves the doorbell graphs to their first
+use instead of capturing them at start-up.
 Server: `STRATA_PARALLEL_SOLO=1` sends a lane left alone back to the solo path (by default it stays in its lane: a
 lane alone already runs the solo window).
 
 Limits: two lanes on two stages only; no penalties and no lookup / suffix drafts in a lane (as in batch slots);
-requests with pictures run solo, after the lanes are idle (one M-RoPE table per device); the adaptive VRAM tier does
-not run between lane windows (the GO condition has every expert resident). A lane's tokens equal its solo tokens
-(greedy, and sampled with a seed) as long as no prompt read lends experts meanwhile; with prompt borrowing on, a
-lane's windows during another request's read compute the lent experts on the CPU, as batch slots do.
+requests with pictures run solo, after the lanes are idle (one M-RoPE table per device), and a prompt read does not
+give way to them; the adaptive VRAM tier does not run between lane windows (the GO condition has every expert
+resident). The lane verifiers are set up as `--pipeline-windows`' verifiers are (`set_always_publish`): a one-token
+window never advances the GDN state itself, the commit graph does (on CUDA that self-commit is otherwise on by
+default).
 
-Measured on 2x Radeon AI PRO R9700 (gfx1201), IQ3_S, layer split 26/22, `--trim-stage-weights`, on a 0.1.40.2-based
-build of this code (through the HTTP server, 512 tokens per answer, temperature 0.7):
+**Exactness, and where it was checked.** A lane's tokens equal its solo tokens (greedy, and sampled with a seed) when
+no prompt read lends experts meanwhile. This was checked only on HIP: 2x Radeon AI PRO R9700 32 GB (gfx1201, ROCm
+7.2.4), Linux, Qwen3.8-Flash-Next IQ3_S, layer split 26/22, every expert resident on both cards, with
+`--no-prefill-borrow --pcie-frac 0 --adapt-every 1000000 --kv-resident 32768`: `tools/batch_test.py` greedy (1000
+tokens per lane) and seeded sampled (temperature 0.7, 300 tokens), both lanes IDENTICAL to solo, on the binary with
+the review fixes and on the one before them. With one-token windows that commit themselves
+(`STRATA_ONE_TOKEN_COMMIT=1`, `--spec-min-p 1.5`, 300 tokens per lane) the lanes before the fixes diverged from solo
+after 6 and 45 tokens; with the fixes they were IDENTICAL, pipelined and serial. CUDA, SYCL and Windows were not built
+or run. With prompt borrowing on, a lane's windows during another request's read compute the lent experts on the CPU, as
+batch slots do, so its text can differ from the solo text (in our 20K-token test it stayed coherent).
 
-| Concurrent | `--batch 2` pipelined groups (v0.1.43) | `--lanes 2` |
-| ---: | ---: | ---: |
-| 1 | 82 tok/s | 82 tok/s |
-| 2 | 94.9 tok/s | 123.6 tok/s |
-| 4 | 94.1 tok/s | 128.6 tok/s |
+Operational note for such exactness runs on 2x 32 GB cards: `--no-prefill-borrow` makes the later stage hold back the
+prompt and ring buffers (about 1.7 GiB). At `--kv-resident 65536` the second card then kept 11124 of 11264 experts, the
+engine printed NO-GO and every lane window ran serially. Use `--kv-resident 32768` for these runs. With borrowing on
+(the production-like setting) `--kv-resident 65536` fits and prints GO.
 
-While both lanes generate, the engine's own line (`strata lanes (pipelined)`) reported 185-192 tok/s together;
-the two lanes took 1295 MiB of VRAM on GPU 0 and 1406 MiB on GPU 1, and every expert stayed resident.
+Measured with one HIP build of v0.1.43 plus all four lanes commits (the review fixes included), on the same machine
+as above, `--kv-resident 65536`, prompt borrowing on. The control is the same binary with `--batch 2` and no lanes,
+which runs 0.1.43's pipelined groups (`--batch-groups auto: 2 groups of 1 slot`). Through the HTTP server, after a
+short warm-up: C different requests at once, 512 tokens each, temperature 0.7, median of two rounds, one server run
+each. Aggregate / per-stream rate / TTFT:
+
+| Concurrent | `--batch 2` (pipelined groups) | `--lanes 2` | Lanes / control |
+| ---: | ---: | ---: | ---: |
+| 1 | 86.1 / 95.9 tok/s / 0.62 s | 83.6 / 92.6 tok/s / 0.60 s | 0.97x |
+| 2 | 86.7 / 47.7 tok/s / 1.04 s | 111.9 / 63.4 tok/s / 1.06 s | 1.29x |
+| 4 | 83.6 / 44.5 tok/s / 4.21 s | 111.7 / 68.2 tok/s / 3.43 s | 1.34x |
+
+At C=1 both configs run the same solo path, so the 3 % gap there is most likely sampling noise at temperature 0.7 (the
+greedy solo benchmark on the same servers: lanes config 120.2 tok/s, control 119.4). At C=4 each new request reads
+its prompt while the other lane runs alone, so C=4 is not above C=2. The tree before the review fixes gave the same
+picture (mean of two server runs: 84.7 / 113.8 / 111.9 tok/s against 89.1 / 87.4 / 84.7).
+
+While both lanes generate (greedy, 1000 tokens per lane), the engine's own line (`strata lanes (pipelined)`) reported
+169.8 tok/s together: a cycle of 30.3 ms for one window of each lane, 2.01 and 3.15 tokens per window (the solo runs
+of the same prompts: 2.25 and 3.13). Every expert stayed resident; the lanes took 1321 MiB of VRAM on GPU 0 and
+1430 MiB on GPU 1 at `--kv-resident 32768`, and 1719 / 1828 MiB at 65536.
+
+The server's image handling was checked on the same lanes server (vision on, CPU encoder): a picture request sent
+while a ~29K-token text read was running, and a read, a short text request and a picture request at once. Every
+request answered with HTTP 200 in 8.6-11.9 s and none hung (before the fix the first case hung). The server log does
+not print the `BYIELD` / `GENI` lines, so their order was not checked from the logs.
 
 ## Together with conversation parking
 

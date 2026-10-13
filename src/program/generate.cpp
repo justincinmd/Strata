@@ -7704,6 +7704,12 @@ int main(int argc, char** argv) {
                 lane_v[b][0].set_stage(0, split_at[0], nullptr, hand_l);
                 lane_v[b][1].set_stage(split_at[0], -1, hand_l, nullptr);
                 lane_v[b][0].set_stream(lane_stream[0]);   // stage 0 shared; stage 1 keeps its own (see above)
+                // as --pipeline-windows' verifiers: lane_pump commits every window with pl_commit_async, which always
+                // launches the commit graph, so a one-token window must not advance the GDN state itself as well
+                // (one_token_self_commit: on by default on CUDA, STRATA_ONE_TOKEN_COMMIT=1 on HIP).  Before init, so
+                // every captured window graph and the serial lane_window's commit() agree.  Also: a doorbell window
+                // (experts out of VRAM) copies every layer's rows to the host, and the device-planned layers are off.
+                for (int st = 0; st < 2; ++st) lane_v[b][st].set_always_publish(true);
                 {
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;

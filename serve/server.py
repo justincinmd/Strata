@@ -777,6 +777,9 @@ class StrataEngine:
             self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
+            # --lanes: slots whose read gave way (BYIELD) and now waits for the control lines to go on.  An image
+            # request waiting for the lanes to empty gives the lines back while one is set (generate_batched).
+            self.slot_parked: set[int] = set()
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
@@ -1224,10 +1227,11 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, solo: bool = False):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
-        entry = [plen]
+        `after_epoch`: a request whose read gave way lets the requests waiting then go first.  `solo`: the request
+        can only run solo (--lanes: an image), so a read does not give way to it (_shorter_waiting)."""
+        entry = [plen, solo]
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1286,9 +1290,12 @@ class StrataEngine:
         --lanes: only when `free_needed` slots are free (the part read parks in one, the shorter request needs
         one): with both lanes taken the shorter request could not start before a lane ends, so giving way buys nothing."""
         with self.slot_cv:
-            if getattr(self, "lanes", 0) and sum(1 for b in self.slot_busy if not b) < free_needed:
+            lanes = getattr(self, "lanes", 0)
+            if lanes and sum(1 for b in self.slot_busy if not b) < free_needed:
                 return False
-            return any(e[0] * 2 <= plen for e in self.wait_lens)
+            # --lanes: not to a request that runs solo only (an image): it waits until no lane is busy, and the part
+            # read would wait in a lane, so it could not start before this read ends either
+            return any(e[0] * 2 <= plen and not (lanes and e[1:2] == [True]) for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -1309,7 +1316,8 @@ class StrataEngine:
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt))
+        solo_only = bool(getattr(self, "lanes", 0) and embeddings)   # --lanes: one M-RoPE table per device - images solo
+        ok = yield from self._take_control(cancel, len(prompt), solo=solo_only)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1322,16 +1330,38 @@ class StrataEngine:
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
-                    ok = yield from self._take_control(cancel, len(prompt))
+                    ok = yield from self._take_control(cancel, len(prompt), solo=solo_only)
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
-                solo_only = bool(getattr(self, "lanes", 0) and embeddings)   # --lanes: one M-RoPE table per device - images solo
-                while solo_only:                # ... once no lane decodes (this request holds the control lines)
+                # --lanes, a request with images: GENI once no lane is busy.  A decoding lane ends by itself (its BDONE
+                # needs no control lines), so the request keeps the lines while it waits and no new request takes a
+                # lane meanwhile.  But a read that gave way (BYIELD) waits in its lane for the lines to go on: then they
+                # are given back until it has them, taken again, and the lanes checked again (else a deadlock).
+                while solo_only:
                     with self.slot_cv:
                         if not any(self.slot_busy):
                             break
-                        self.slot_cv.wait(timeout=5.0)
+                        parked = bool(self.slot_parked)
+                        if not parked:
+                            self.slot_cv.wait(timeout=5.0)
+                    if parked:
+                        if holding:
+                            self.ctl.release()
+                            holding = False
+                        while True:
+                            with self.slot_cv:
+                                if not self.slot_parked:
+                                    break
+                                self.slot_cv.wait(timeout=1.0)
+                            if cancel.is_set():
+                                return
+                            yield None
+                        ok = yield from self._take_control(cancel, len(prompt), solo=True)
+                        if not ok:
+                            return
+                        holding, born = True, self.gen
+                        continue
                     if cancel.is_set():
                         return
                     yield None
@@ -1437,11 +1467,18 @@ class StrataEngine:
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
                         yields += 1
+                        with self.slot_cv:                  # parked: its slot is busy and it needs the lines to go on
+                            self.slot_parked.add(slot)
                         self.ctl.release()
                         holding = False
                         with self.slot_cv:
                             epoch = self.ctl_epoch
-                        ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
+                        try:
+                            ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
+                        finally:
+                            with self.slot_cv:
+                                self.slot_parked.discard(slot)
+                                self.slot_cv.notify_all()
                         if not ok:
                             return
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)

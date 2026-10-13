@@ -98,7 +98,7 @@ while True:
             active[b][1] = 0
             stopped.add(b)
         continue
-    if line.startswith(("GEN ", "BGEN ")):
+    if line.startswith(("GEN ", "GENI ", "BGEN ")):    # GENI <max_new> [keys] <embeddings> <ids>: an image request, solo
         f = line.split()
         slot = int(f[1]) if f[0] == "BGEN" else None
         max_new = int(f[2] if f[0] == "BGEN" else f[1])
@@ -109,7 +109,7 @@ while True:
         if log:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
         pb = bytes(int(x) & 255 for x in ids)
-        mark = b"NFSOLO" if f[0] == "GEN" else b"NFADMIT"
+        mark = b"NFSOLO" if f[0] in ("GEN", "GENI") else b"NFADMIT"
         if mark in pb and mark not in fired:
             fired.add(mark)
             print(f"DONE 0 {len(ids)} 5.0 0.0 nonfinite 0 0 0", flush=True)
@@ -578,6 +578,105 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(res[long_q][0], "ok, done.")
         self.assertEqual(res[short_q][0], "ok, done.")
         self.assertTrue(any(x.startswith("YIELD ") for x in self.log.read_text().splitlines()))
+
+    def drive(self, gen):
+        """Runs a generate_batched generator on its own thread -> (tokens, done event, thread)."""
+        out, done = [], threading.Event()
+
+        def go():
+            try:
+                for t in gen:
+                    if t is not None:
+                        out.append(t)
+            except Exception as e:   # noqa: BLE001 - the test reads it from `out`
+                out.append(e)
+            finally:
+                done.set()
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        return out, done, th
+
+    def test_lanes_an_image_request_after_a_long_read(self):
+        """--lanes (review finding): a long text read, then a short image request.  An image runs solo (GENI) once no
+        lane is busy.  The read used to give way (BYIELD) to it: its part then waited in a lane for the control lines
+        while the image request held them and waited for that lane - a deadlock.  Now a read never gives way to a
+        request that can only run solo (it could not start before the read ends), and both are answered."""
+        self.start(2, lanes=True)
+        res = {}
+        th = threading.Thread(target=lambda: res.setdefault("long", self.chat("long " * 600)))
+        th.start()
+        time.sleep(0.15)                                 # the long read is under way
+        cancel = threading.Event()
+        out, done, _ = self.drive(self.engine.generate_batched(list(b"look at this"), 16, {}, cancel, embeddings="IMG"))
+        finished = done.wait(20)
+        cancel.set()                                     # (a stuck image request ends, so the test ends)
+        th.join(30)
+        self.assertTrue(finished, "the image request never ran: it waited for a lane with the control lines held")
+        self.assertEqual(bytes(t for t in out if isinstance(t, int) and t < 256), b"ok, done.", out)
+        self.assertEqual(res["long"]["choices"][0]["message"]["content"], "ok, done.")
+        log = self.log.read_text().splitlines()
+        self.assertFalse(any(x.startswith("YIELD ") for x in log), log)
+        self.assertTrue(any(x.startswith("GENI ") for x in log), log)
+        self.assertFalse(any(self.engine.slot_busy))
+        self.assertEqual(getattr(self.engine, "slot_parked", set()), set())
+
+    def test_lanes_an_image_request_gives_the_lines_to_a_parked_read(self):
+        """--lanes (review finding): a read that gave way (BYIELD) to a shorter text request waits in a lane for the
+        control lines.  An image request that gets them first must give them back while it waits for the lanes, then
+        take them again and check the lanes once more before its GENI."""
+        self.start(2, lanes=True)
+        e = self.engine
+        with e.slot_cv:
+            e.slot_busy[0] = True                        # a read's part waits in lane 0 ...
+            e.slot_claims.add(0)
+            e.slot_parked.add(0)                         # ... for the control lines (as after a BYIELD)
+        cancel = threading.Event()
+        out, done, _ = self.drive(e.generate_batched(list(b"see this"), 16, {}, cancel, embeddings="IMG"))
+        time.sleep(0.3)                                  # it has taken the lines and found lane 0 busy
+        got = e.ctl.acquire(timeout=5)                   # the parked read takes the lines back
+        try:
+            self.assertTrue(got, "the image request kept the control lines while a parked read needed them")
+            with e.slot_cv:
+                e.slot_parked.discard(0)                 # (the read has the lines: it goes on in its lane)
+                e.slot_cv.notify_all()
+            time.sleep(0.3)
+            self.assertFalse(done.is_set(), "the image request ran beside a busy lane")
+            with e.slot_cv:                              # the read admitted, decoded, and its lane ended
+                e.slot_busy[0] = False
+                e.slot_claims.discard(0)
+                e.slot_cv.notify_all()
+        finally:
+            if got:
+                e.ctl.release()
+            else:
+                cancel.set()
+        self.assertTrue(done.wait(20), "the image request never ran after the lane ended")
+        self.assertEqual(bytes(t for t in out if isinstance(t, int) and t < 256), b"ok, done.", out)
+        self.assertTrue(any(x.startswith("GENI ") for x in self.log.read_text().splitlines()))
+        self.assertTrue(e.ctl.acquire(timeout=5))       # and it gave the lines back at the end
+        e.ctl.release()
+
+    def test_lanes_long_short_and_image_all_answered(self):
+        """--lanes: a long read, a short text request (the read gives way to it) and an image request at once: all
+        three are answered, whichever of them gets the control lines first after the read gives way."""
+        self.start(2, lanes=True)
+        res = {}
+        th = [threading.Thread(target=lambda: res.setdefault("long", self.chat("long " * 600)))]
+        th[0].start()
+        time.sleep(0.15)
+        th.append(threading.Thread(target=lambda: res.setdefault("short", self.chat("short"))))
+        th[1].start()
+        cancel = threading.Event()
+        out, done, _ = self.drive(self.engine.generate_batched(list(b"see this"), 16, {}, cancel, embeddings="IMG"))
+        finished = done.wait(30)
+        cancel.set()
+        for t in th:
+            t.join(30)
+        self.assertTrue(finished, "the image request never ran")
+        self.assertEqual(bytes(t for t in out if isinstance(t, int) and t < 256), b"ok, done.", out)
+        self.assertEqual(res["long"]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(res["short"]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertFalse(any(self.engine.slot_busy))
 
     def test_next_turn_goes_back_to_its_slot(self):
         self.start(2)
