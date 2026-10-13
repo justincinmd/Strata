@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Batching test: the same prompts decoded alone (GEN, the usual path with drafts) and together in the batch
 windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints the aggregate decode rate.
+The same test covers the dual lanes (--batch 2 --lanes 2, or a config with "lanes": 2: each slot decodes as a solo request).
 
   python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 4 --n 4 \
       --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
@@ -41,6 +42,8 @@ class Engine:
             args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
         if batch:
             args += ["--batch", str(batch)]
+        if cfg.get("lanes") == 2 and "--lanes" not in args:   # the server's "lanes": 2
+            args += ["--lanes", "2"]
         args += extra_args
         env = dict(os.environ, **extra_env)
         env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
@@ -79,6 +82,11 @@ def main():
                     help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
                          "beside the earlier slots' windows (the prompt path lends experts then)")
     ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
+    ap.add_argument("--config-env", action="store_true",
+                    help="start the engine with the config's \"env\" block too (as the server does); the test's own "
+                         "variables (STRATA_DECODE_TIMING, STRATA_IQ_MT_MIN) still win")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="one more engine environment variable (repeatable), e.g. --env STRATA_LANES=2 for the dual lanes")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
@@ -92,7 +100,13 @@ def main():
             filler = "".join(para % i for i in range(a.long_tokens // per + 1))
             text = f"<|im_start|>user\n{filler}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         prompts.append(tok.encode(text, parse_special=True))
-    env = {"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
+    env = {}
+    if a.config_env:
+        env.update({k: str(v) for k, v in (cfg.get("env") or {}).items()})
+    for kv in a.env:
+        k, _, v = kv.partition("=")
+        env[k] = v
+    env.update({"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})})
     if a.mt_min:
         env["STRATA_IQ_MT_MIN"] = a.mt_min
     eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())

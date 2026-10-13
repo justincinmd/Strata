@@ -748,6 +748,12 @@ class StrataEngine:
         # conversation cache - see pick_slot
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+        # --lanes 2 (opt-in, config "lanes": 2): the engine runs the two slots as dual lanes (INFO lanes=2, each a full
+        # solo chain with its own MTP drafter).  A lane left alone stays in its lane, and requests with images run solo.
+        self.lanes = int(self.info.get("lanes") or 0) if self.batch else 0
+        if self.lanes:
+            print(f"[strata] lanes: {self.batch} requests decode at once, each with its own MTP drafter; one request "
+                  "alone runs the solo path, more wait for a lane", flush=True)
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
@@ -1268,12 +1274,20 @@ class StrataEngine:
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
                 not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
+        # --lanes: a lane alone decodes the solo window at solo speed, so it stays (no copy back, no promotion
+        # again when the next request comes).  STRATA_PARALLEL_SOLO=1 restores the batch slots' rule.
+        if getattr(self, "lanes", 0) and os.environ.get("STRATA_PARALLEL_SOLO") != "1":
+            return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
-    def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+    def _shorter_waiting(self, plen: int, free_needed: int = 0) -> bool:
+        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to.
+        --lanes: only when `free_needed` slots are free (the part read parks in one, the shorter request needs
+        one): with both lanes taken the shorter request could not start before a lane ends, so giving way buys nothing."""
         with self.slot_cv:
+            if getattr(self, "lanes", 0) and sum(1 for b in self.slot_busy if not b) < free_needed:
+                return False
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -1312,9 +1326,18 @@ class StrataEngine:
                     if not ok:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
+                solo_only = bool(getattr(self, "lanes", 0) and embeddings)   # --lanes: one M-RoPE table per device - images solo
+                while solo_only:                # ... once no lane decodes (this request holds the control lines)
+                    with self.slot_cv:
+                        if not any(self.slot_busy):
+                            break
+                        self.slot_cv.wait(timeout=5.0)
+                    if cancel.is_set():
+                        return
+                    yield None
                 with self.slot_cv:
-                    alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                    alone = (not any(self.slot_busy) and self.waiting == 0) or solo_only
+                if alone and (left > 1 or solo_only):
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
@@ -1324,14 +1347,14 @@ class StrataEngine:
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
-                    for x in self._control(cancel, pending.append, stop_when=others):
+                    for x in self._control(cancel, pending.append, stop_when=None if solo_only else others):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
                             if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
+                                    self._shorter_waiting(len(prompt), 2)):
                                 with self.slot_cv:          # the slot the part read will wait in
                                     reserved = self.pick_slot(prompt)
                                     if reserved is not None:
@@ -1358,7 +1381,8 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if (cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS)
+                                or solo_only):
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -1441,7 +1465,7 @@ class StrataEngine:
                             yield t
                         if x is None:
                             if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
+                                    self._shorter_waiting(len(prompt), 1)):
                                 self._send(f"BYIELD {slot}")
                                 asked = True
                             yield None
@@ -2365,8 +2389,29 @@ def engine_args(cfg: dict) -> list[str]:
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    args += lanes_args(cfg, args)
     args += parallel_args(cfg, args)
     return learned_profile_args(cfg, args)
+
+
+def lanes_args(cfg: dict, args: list[str]) -> list[str]:
+    """Opt-in (docs/BATCHING.md "Dual lanes"): "lanes": 2 in the config - two requests decode at once in the
+    engine's dual lanes on a two-GPU layer split (--lanes 2 --batch 2), each with its own full MTP drafter; one request
+    alone runs the solo path, a third waits.  The engine refuses lanes it cannot run (its log says why) and the server
+    then uses its batch slots.  Absent: nothing changes."""
+    n = cfg.get("lanes")
+    if n is None or n is False:
+        return []
+    if isinstance(n, bool) or n != 2:
+        print(f'[strata] "lanes" must be 2, not {n!r}: ignored', flush=True)
+        return []
+    out = [] if "--lanes" in args else ["--lanes", "2"]
+    if "--batch" not in args and "--slots" not in args:
+        if cfg.get("parallel") not in (None, False, 2):
+            print(f'[strata] "lanes": 2 runs two requests at once: "parallel": {cfg.get("parallel")!r} is ignored',
+                  flush=True)
+        out += ["--batch", "2"]
+    return out
 
 
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it

@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
+from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, lanes_args, parallel_args, serve
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -40,7 +40,8 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else "") +
+      (" lanes=2" if "--lanes" in args else ""), flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
 def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
@@ -175,6 +176,19 @@ while True:
 
 
 class ParallelArgs(unittest.TestCase):
+    def test_lanes_config_key(self):
+        """--lanes: "lanes": 2 -> --lanes 2 --batch 2; absent or another value: nothing."""
+        self.assertEqual(lanes_args({"lanes": 2}, []), ["--lanes", "2", "--batch", "2"])
+        self.assertEqual(lanes_args({"lanes": 2, "parallel": 4}, []), ["--lanes", "2", "--batch", "2"])
+        self.assertEqual(lanes_args({"lanes": 2}, ["--batch", "2"]), ["--lanes", "2"])
+        self.assertEqual(lanes_args({}, []), [])
+        self.assertEqual(lanes_args({"lanes": 3}, []), [])
+        self.assertEqual(lanes_args({"lanes": True}, []), [])
+        args = engine_args({"args": ["--pack", "p"], "lanes": 2, "parallel": 2})
+        self.assertEqual(args.count("--batch"), 1)
+        self.assertIn("--lanes", args)
+        self.assertNotIn("--lanes", engine_args({"args": ["--pack", "p"], "parallel": 2}))
+
     def test_parallel_config_key(self):
         self.assertEqual(parallel_args({"parallel": 4}, []), ["--batch", "4"])
         self.assertEqual(parallel_args({"parallel": 1}, []), [])
@@ -266,7 +280,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=()):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False, says_groups=0, more=(), lanes=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -279,6 +293,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--reuse"] if reuse else []
         extra += ["--says-groups", str(says_groups)] if says_groups else []
         extra += list(more)
+        extra += ["--lanes"] if lanes else []
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = StrataEngine("strata", extra)
@@ -520,6 +535,49 @@ class ParallelService(unittest.TestCase):
         self.assertFalse(any(self.engine.slot_busy))
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
+
+    def test_lanes_a_lane_left_alone_stays_in_it(self):
+        """--lanes: with lanes (INFO lanes=2) a request left alone in its lane stays there: no BSTOP and
+        no copy back to the solo path (a lane alone decodes the solo window)."""
+        self.start(2, slot_cache=True, lanes=True)
+        self.assertEqual(self.engine.lanes, 2)
+        res = {}
+        long = threading.Thread(target=lambda: res.setdefault("long", self.chat("LONGREPLY please", max_tokens=200)))
+        long.start()
+        time.sleep(0.05)
+        short = self.chat("short", max_tokens=200)
+        long.join(30)
+        self.assertEqual(short["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(res["long"]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        kinds = [x.split()[0] for x in self.log.read_text().splitlines()]
+        self.assertIn("BGEN", kinds)
+        self.assertEqual(kinds[-1], "BGEN", kinds)       # (batch slots: a GEN last, test above)
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_lanes_no_way_given_without_a_free_lane(self):
+        """--lanes: an admission does not give way (BYIELD) when both lanes are taken - the shorter request could
+        not start and would hold the control lines until a lane ends."""
+        self.start(2, lanes=True)
+        bg = threading.Thread(target=lambda: self.chat("LONGREPLY background", max_tokens=60))
+        bg.start()
+        time.sleep(0.05)
+        long_q, short_q = "long " * 600, "short"
+        res = self.race(long_q, short_q)
+        bg.join(30)
+        self.assertEqual(res[long_q][0], "ok, done.")
+        self.assertEqual(res[short_q][0], "ok, done.")
+        log = self.log.read_text().splitlines()
+        self.assertFalse(any(x.startswith("YIELD ") for x in log), log)
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_lanes_a_long_solo_read_still_gives_way(self):
+        """--lanes: a solo read (no lane busy) still gives way to a much shorter request."""
+        self.start(2, lanes=True)
+        long_q, short_q = "long " * 600, "short"
+        res = self.race(long_q, short_q)
+        self.assertEqual(res[long_q][0], "ok, done.")
+        self.assertEqual(res[short_q][0], "ok, done.")
+        self.assertTrue(any(x.startswith("YIELD ") for x in self.log.read_text().splitlines()))
 
     def test_next_turn_goes_back_to_its_slot(self):
         self.start(2)

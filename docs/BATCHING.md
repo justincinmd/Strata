@@ -262,6 +262,55 @@ tok/s, at 0.7 -> 358 tok/s.
 `--trim-stage-weights` alone raised the share of experts held in VRAM on that machine from 76-85 % to 84-100 %
 per card.
 
+## Dual lanes (`--lanes 2`, opt-in)
+
+On a layer split into two stages on two GPUs, `--lanes 2` turns the two batch slots into two **lanes**. A lane
+decodes a request the way the solo path does: its own verifier on each stage (on the slot's sessions, with its own
+hand-off), its own full MTP drafter on the last stage (the solo drafter's weights and draft head, its own K/V), and
+the solo window graphs (zero-doorbell, MTP windows of up to `--mtp-max-t` tokens). With both lanes busy, `lane_pump`
+pipelines them across the cards: GPU 0 runs lane A's stage-0 window while GPU 1 runs lane B's stage-1 window and then
+B's draft. Batch slots, by contrast, either decode one token per slot per window (serial, or pipelined
+`--batch-groups`, which drop the MTP drafts) or verify one MTP proposal per slot (`--batch-mtp`, serial stages).
+
+Turn it on with the config key `"lanes": 2` (the server adds `--lanes 2 --batch 2`), or on the engine with
+`--serve --batch 2 --lanes 2` (or `STRATA_LANES=2`). It needs `--mtp` and `--spec`, and every expert of both
+stages resident in VRAM for the pipelined windows (`--trim-stage-weights` helps); the start-up log says
+`strata lanes: GO (every expert resident on both stages)` or `NO-GO`. A request alone still runs the solo path; a
+second request promotes the first into a lane (as for batch slots); a third waits for a lane.
+
+How it combines with the other batch switches:
+
+- `--batch-groups`: the lanes replace the batch windows. With no `--batch-groups` given, the 0.1.41 default gives way
+  (one group, said once at start-up). An explicit `--batch-groups` above 1, or `auto`, turns the lanes off with a
+  warning (`--batch-groups 1` is fine).
+- `--batch-mtp` / `STRATA_BATCH_MTP=1`: turned off with a warning (each lane has the full drafter).
+- `--batch N` above 2 is set to 2. `--pipeline-windows`, `--peer-device` and helper expert caches turn the lanes off.
+
+Engine switches (A/B and diagnostics): `STRATA_LANES_SERIAL=1` runs the lanes' windows one after the other (no
+pipelining); `STRATA_LANES_DRAFT_SYNC=1` drafts with the blocking `draft()` inside the pump;
+`STRATA_LANES_DRAFT_PRIO=1` creates the lane drafters' streams at the highest priority (slower on 2x R9700);
+`STRATA_LANES_PRECAPTURE_NR=0` leaves the doorbell graphs to their first use instead of capturing them at start-up.
+Server: `STRATA_PARALLEL_SOLO=1` sends a lane left alone back to the solo path (by default it stays in its lane: a
+lane alone already runs the solo window).
+
+Limits: two lanes on two stages only; no penalties and no lookup / suffix drafts in a lane (as in batch slots);
+requests with pictures run solo, after the lanes are idle (one M-RoPE table per device); the adaptive VRAM tier does
+not run between lane windows (the GO condition has every expert resident). A lane's tokens equal its solo tokens
+(greedy, and sampled with a seed) as long as no prompt read lends experts meanwhile; with prompt borrowing on, a
+lane's windows during another request's read compute the lent experts on the CPU, as batch slots do.
+
+Measured on 2x Radeon AI PRO R9700 (gfx1201), IQ3_S, layer split 26/22, `--trim-stage-weights`, on a 0.1.40.2-based
+build of this code (through the HTTP server, 512 tokens per answer, temperature 0.7):
+
+| Concurrent | `--batch 2` pipelined groups (v0.1.43) | `--lanes 2` |
+| ---: | ---: | ---: |
+| 1 | 82 tok/s | 82 tok/s |
+| 2 | 94.9 tok/s | 123.6 tok/s |
+| 4 | 94.1 tok/s | 128.6 tok/s |
+
+While both lanes generate, the engine's own line (`strata lanes (pipelined)`) reported 185-192 tok/s together;
+the two lanes took 1295 MiB of VRAM on GPU 0 and 1406 MiB on GPU 1, and every expert stayed resident.
+
 ## Together with conversation parking
 
 `--conversation-cache-mib N --conversation-cache-slots K` (DETAILS.md) works with the layer split too: a request
