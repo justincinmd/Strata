@@ -559,6 +559,9 @@ struct Options {
     bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
     bool batch_groups_auto = false;   ///< --batch-groups auto (#417 stage 1): one group per stage of a layer split, if it divides --batch
     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
+    /// --lanes 2 / STRATA_LANES=2 (opt-in): two requests decode in "lanes" on a two-stage layer split, each with its
+    /// own verifier chain and full MTP drafter (docs/BATCHING.md "Dual lanes").  0 = off.
+    int lanes = 0;
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
@@ -786,6 +789,10 @@ void usage() {
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
                  "                       slot drafters sit on the last stage's GPU; not with --batch-groups); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
+                 "  --lanes 2            --serve --batch 2 on a layer split into two stages on two GPUs, with --mtp (opt-in;\n"
+                 "                       STRATA_LANES=2): each slot decodes as a solo request with its own verifiers and\n"
+                 "                       full MTP drafter, the two pipelined across the GPUs; not with --batch-groups or\n"
+                 "                       --batch-mtp; docs/BATCHING.md\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 3+ stages on AMD gfx12;\n"
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
@@ -1987,6 +1994,7 @@ int main(int argc, char** argv) {
             else o.batch_groups = std::atoi(bgv);
         }
         else if (a == "--batch-mtp") o.batch_mtp = true;
+        else if (a == "--lanes") o.lanes = std::atoi(next("--lanes"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
@@ -4302,6 +4310,52 @@ int main(int argc, char** argv) {
     // force: when it cannot run it is said and left off (plain batching still starts); default off = exactly 0.1.39.
     // With a layer split the slots' drafters live on the LAST stage's GPU (where the solo drafter, the head and the final
     // residual rows are); the windows are the ones --batch runs, two rows per slot, through every stage.
+    // --lanes 2 (opt-in; STRATA_LANES=2; docs/BATCHING.md "Dual lanes"): the two --batch slots of a layer split into two
+    // stages on two GPUs decode as two solo requests, each with its own verifier chain on both stages (its own hand-off)
+    // and its own full MTP drafter on the last stage, the two pipelined across the cards (lane_pump in the serve loop).
+    // The main session stays the solo path and the place every prompt is read.  The lanes replace the batch windows, so
+    // they do not combine with --batch-groups (an explicit number or `auto` turns the lanes off; the 0.1.41 default gives
+    // way: one group) or --batch-mtp (turned off: each lane drafts with the full drafter).  Unset: nothing below changes.
+    bool lanes = false;
+    {
+        int want = o.lanes;
+        if (const char* v = std::getenv("STRATA_LANES"); v != nullptr && v[0] != '\0') want = std::max(want, std::atoi(v));
+        if (want >= 2) {
+            const char* why = !o.serve ? "it needs --serve"
+                            : split_same || !multi_gpu || stages.size() != 1 ? "it needs a layer split into exactly two stages, each on its own GPU"
+                            : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
+                            : o.batch < 2 ? "it needs --batch 2"
+                            : o.batch_groups_set && (o.batch_groups_auto || o.batch_groups > 1)
+                            ? "not with --batch-groups (pipelined slot groups; leave it out or pass --batch-groups 1)"
+                            : o.pipeline_windows > 0 ? "not with --pipeline-windows"
+                            : o.peer_device >= 1 ? "not with --peer-device"
+                            : remote_caches || o.remote_expert_opt ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
+                            : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata generate: WARNING: --lanes is off: %s\n", why);
+            } else {
+                lanes = true;
+                if (want > 2) std::fprintf(stderr, "strata generate: WARNING: --lanes %d: two lanes (one per batch slot) for now\n", want);
+                if (o.batch > 2) {
+                    std::fprintf(stderr, "strata generate: WARNING: --batch %d is set to 2: --lanes 2 runs one slot per lane\n", o.batch);
+                    o.batch = 2;
+                }
+            }
+        }
+        o.lanes = lanes ? 2 : 0;
+    }
+    // the pipelined lanes (lane_pump) by default; STRATA_LANES_SERIAL=1 runs the lanes' windows one after the other (the
+    // A/B).  Pipelined only: STRATA_LANES_DRAFT_SYNC=1 drafts with the blocking draft() inside the pump;
+    // STRATA_LANES_DRAFT_PRIO=1 creates the lane drafters' streams at the device's highest priority (2x R9700: the default
+    // priority was faster, cycle 26.8 vs 29.7 ms).
+    auto env_on = [](const char* n, bool dflt) {
+        const char* v = std::getenv(n);
+        return v == nullptr || v[0] == '\0' ? dflt : v[0] != '0';
+    };
+    const bool lanes_serial = lanes && env_on("STRATA_LANES_SERIAL", false);
+    const bool lanes_pipe = lanes && !lanes_serial;
+    const bool lanes_draft_sync = lanes_pipe && env_on("STRATA_LANES_DRAFT_SYNC", false);
+    const bool lanes_prio = lanes_pipe && env_on("STRATA_LANES_DRAFT_PRIO", false);
     // --batch-groups: given as a number or auto, or (0.1.41) auto by default for a layer split with --batch >= 2.  The
     // pipelined slot groups run neither --batch-mtp's drafts nor the batch adaptive tier (--adapt-async 1), so when one of
     // them is asked for and the groups were not given, the default is one group (batch_groups.hpp).  Evaluated again
@@ -4315,10 +4369,15 @@ int main(int argc, char** argv) {
         bin.later_stages = (int) stages.size();
         bin.batch_mtp = mtp_on;
         bin.adapt_async = o.adapt_async != 0;
+        bin.lanes = lanes;
         return strata::program::batch_groups::resolve(bin);
     };
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+    if (batch_mtp && lanes) {
+        std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: --lanes 2 gives each lane its own full drafter\n");
+        batch_mtp = false;
+    }
     if (batch_mtp) {
         // (--pipeline-windows is already off with --batch slots)
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
@@ -4425,6 +4484,20 @@ int main(int argc, char** argv) {
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
+    // lanes: what they take before the expert caches are sized (their slot sessions, then their drafters), per stage;
+    // reported with the rest at lane setup
+    int64_t lane_pre_bytes[2] = {0, 0};
+    if (lanes && o.batch < 2) {
+        std::fprintf(stderr, "strata generate: WARNING: lanes are off: the two slot sessions do not fit\n");
+        lanes = false;
+        o.lanes = 0;
+    }
+    if (lanes)
+        for (int k = 0; k < 2; ++k)
+            lane_pre_bytes[k] = 2 * (int64_t) strata::core::session_bytes(g, o.max_context, K, k == 0 ? 0 : stages[0]->lb,
+                                                                          k == 0 ? split_at[0] : stages[0]->le);
+    // the lanes' MTP windows: the solo request's (the MTP part of --spec; the lanes run no lookup windows)
+    const int lane_t = std::max(2, o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec);
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
@@ -4433,6 +4506,7 @@ int main(int argc, char** argv) {
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
+    std::vector<std::unique_ptr<strata::core::MtpDrafter>> lane_mtp;   ///< lanes: one full drafter per lane
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -4476,6 +4550,31 @@ int main(int argc, char** argv) {
                              (int) slot_mtp.size(), mtp.device(), (double) slot_mtp.front()->vram_bytes() / 1048576.0,
                              (double) fb / 1073741824.0);
             }
+        }
+        if (lanes) {
+            // one full drafter per lane on the last stage, sharing the solo drafter's weights and draft head; its K/V
+            // template and device scratch are the lane's last-stage slot session (as the solo drafter's last_st->ss)
+            size_t fb0 = 0, tb0 = 0, fb1 = 0, tb1 = 0;
+            cudaDeviceSynchronize();
+            cudaMemGetInfo(&fb0, &tb0);
+            for (int b = 0; b < 2; ++b) {
+                auto d = std::make_unique<strata::core::MtpDrafter>();
+                d->set_high_priority(lanes_prio);   // (the draft runs beside the other lane's stage-1 window)
+                d->set_hnorm_per_stream(o.mtp_hnorm_stream);   // as the solo drafter (before any capture)
+                // the solo drafter's row count and the solo serve loop's draft count (S_mtp - 1), so a lane drafts as solo
+                if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], mtp_t, err, o.mtp_window, &mtp)) {
+                    std::fprintf(stderr, "strata generate: lane %d's drafter: %s%s\n", b, err.c_str(), vram_free_note().c_str());
+                    return 1;
+                }
+                if (d->max_t() > lane_t) d->set_max_drafts(lane_t - 1);
+                d->set_ple_session(bslot_ss[0][(size_t) b].get());
+                lane_mtp.push_back(std::move(d));
+            }
+            cudaDeviceSynchronize();
+            cudaMemGetInfo(&fb1, &tb1);
+            lane_pre_bytes[1] += (int64_t) fb0 - (int64_t) fb1;
+            std::fprintf(stderr, "strata generate: lanes: 2 drafters on CUDA%d (the last stage), %d drafts per window, "
+                                 "%.0f MiB\n", last_st->dev, lane_t - 1, (double) ((int64_t) fb0 - (int64_t) fb1) / 1048576.0);
         }
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
@@ -7534,6 +7633,110 @@ int main(int argc, char** argv) {
             // the setters reach the later stages; the pipeline never chains run/commit
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
+        // ---- --lanes 2: per lane a verifier on each stage, on that lane's slot sessions, with its own hand-off and pool
+        // routing.  Stage 0 (CUDA0): one stream shared by both lanes (`set_stream`), so CUDA0 runs one lane's window after
+        // the other's.  Stage 1: each lane's verifier keeps its own stream (the layout measured on 2x R9700; lane_pump
+        // keeps at most one stage-1 window in flight, so the windows still take turns, while a lane's stage-1 commit can
+        // overlap the other lane's window).  Initialized before `ver`, which stays the watchdog's verifier.  The drafters
+        // bind below.
+        strata::core::Verifier lane_v[2][2];   // [lane][stage]
+        SplitDrive lane_sd[2];
+        cudaStream_t lane_stream[2] = {nullptr, nullptr};   // [stage]: stage 0's shared stream; stage 1 none (own streams)
+        size_t lane_free0[2] = {0, 0};                      // [stage]: free VRAM before the lanes' verifiers
+        size_t lane_free1[2] = {0, 0};                      // ... after their arenas
+        auto lane_dev = [&](int st) { return st == 0 ? 0 : stages[0]->dev; };
+        auto free_on = [](int dev) -> size_t {
+            const strata::core::OnDevice on(dev);
+            size_t fb = 0, tb = 0;
+            cudaDeviceSynchronize();
+            cudaMemGetInfo(&fb, &tb);
+            return fb;
+        };
+        if (lanes) {
+            GpuStage& gs = *stages[0];
+            for (int st = 0; st < 2; ++st) {
+                lane_free0[st] = free_on(lane_dev(st));
+                if (st > 0) continue;   // (stage 1: no shared stream, see above)
+                // THE PLE (layer 1, stage 0).  A slot session is carved without the PLE wiring: the batch windows read the
+                // main session's and only each slot's history.  A lane runs the solo graph, which reads its OWN session's
+                // (`ss.ple.ready()` gates the whole module, at capture and per window), so each lane's stage-0 session gets
+                // the main session's table, weights and constants, its own history / token / predecessors, and its own
+                // scratch.  Checked: a lane whose PLE is not ready where the main session's is would decode other tokens.
+                const strata::core::OnDevice on0(lane_dev(0));
+                for (int b = 0; b < 2 && ss.ple.ready(); ++b) {
+                    strata::core::SessionState& ls = *bslot_ss[0][(size_t) b];
+                    ls.ple = ss.ple;
+                    ls.ple.token = &ls.ple_token;
+                    ls.ple.prev = ls.ple_prev;
+                    ls.ple.hist = ls.ple_hist;
+                    float* scr = nullptr;
+                    if (cudaMalloc((void**) &scr, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's PLE scratch does not fit%s\n", b,
+                                     vram_free_note().c_str());
+                        return 1;
+                    }
+                    ls.ple.scratch = scr;
+                }
+                for (int b = 0; b < 2; ++b)
+                    if (bslot_ss[0][(size_t) b]->ple.ready() != ss.ple.ready()) {
+                        std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's session has %s PLE than the main one\n",
+                                     b, ss.ple.ready() ? "no" : "a");
+                        return 1;
+                    }
+                std::fprintf(stderr, "strata lanes: PLE %s on both lanes' CUDA0 sessions\n",
+                             ss.ple.ready() ? "wired (own history and scratch)" : "off, as on the main session");
+                const strata::core::OnDevice on(lane_dev(st));
+                if (cudaStreamCreateWithFlags(&lane_stream[st], cudaStreamNonBlocking) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: lanes: stream creation failed\n");
+                    return 1;
+                }
+            }
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            for (int b = 0; b < 2; ++b) {
+                float *hh = nullptr, *hand_l = nullptr;
+                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &hand_l, hh, 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: lanes: the hand-off allocation failed\n");
+                    return 1;
+                }
+                std::memset(hh, 0, hb);
+                lane_v[b][0].set_stage(0, split_at[0], nullptr, hand_l);
+                lane_v[b][1].set_stage(split_at[0], -1, hand_l, nullptr);
+                lane_v[b][0].set_stream(lane_stream[0]);   // stage 0 shared; stage 1 keeps its own (see above)
+                {
+                    const strata::core::OnDevice on(gs.dev);
+                    strata::core::VerifyHits vs;
+                    vs.d_res = gs.d_res;
+                    vs.h_res = host_res.empty() ? nullptr : host_res.data();
+                    vs.cache_base = gs.cache.device_slot(0);
+                    vs.blob = thits.blob;
+                    vs.slot_off = gs.cache.slot_offsets();
+                    vs.n_slots = gs.cache.slots();
+                    if (!lane_v[b][1].init(gs.wt, g, *bslot_ss[1][(size_t) b], vs, gs.head.loaded() ? &gs.head : nullptr,
+                                           std::max(o.spec, o.batch), err)) {
+                        std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's verifier on CUDA%d: %s%s\n", b, gs.dev,
+                                     err.c_str(), vram_free_note().c_str());
+                        return 1;
+                    }
+                }
+                if (!lane_v[b][0].init(wt, g, *bslot_ss[0][(size_t) b], vh, native_head.loaded() ? &native_head : nullptr,
+                                       std::max(o.spec, o.batch), err)) {
+                    std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's verifier on CUDA0: %s%s\n", b, err.c_str(),
+                                 vram_free_note().c_str());
+                    return 1;
+                }
+                lane_v[b][0].set_next(&lane_v[b][1], &lane_sd[b]);
+                lane_sd[b] = split_drive;
+                lane_sd[b].plan[0] = lane_v[b][0].plan_sink();
+                lane_sd[b].plan[1] = lane_v[b][1].plan_sink();
+                for (int st = 0; st < 2; ++st) {
+                    lane_v[b][st].set_split(o.spec_split);
+                    lane_v[b][st].set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                }
+            }
+            for (int st = 0; st < 2; ++st) lane_free1[st] = free_on(lane_dev(st));
+        }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
@@ -7567,8 +7770,8 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // each stage's verifier gets its stage's slot sessions
-        if (o.batch > 0) {
+        // each stage's verifier gets its stage's slot sessions (--lanes: the slot sessions are the lanes', no batch windows)
+        if (o.batch > 0 && !lanes) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 std::vector<strata::core::SessionState*> ptrs;
                 for (auto& u : bslot_ss[k]) ptrs.push_back(u.get());
@@ -7579,6 +7782,91 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+        }
+        size_t lane_free_pre_bind[2] = {0, 0};   // [stage] (the main verifier and the solo drafter's bind came between)
+        if (lanes) {
+            // the drafters read their lane's last-stage rows directly (no copy), then every graph is captured now, with
+            // nothing in flight: the window graphs T = 1..max and the commit (+ the doorbell variants, unless
+            // STRATA_LANES_PRECAPTURE_NR=0) per verifier, and each drafter's round/step graphs
+            for (int st = 0; st < 2; ++st) lane_free_pre_bind[st] = free_on(lane_dev(st));
+            const strata::core::OnDevice on_l(last_st->dev);
+            for (int b = 0; b < 2; ++b)
+                if (!lane_mtp[(size_t) b]->bind(last_st->wt, &last_st->head, lane_v[b][0].final_R_all(), err, &mtp)) {
+                    std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's drafter: %s%s\n", b, err.c_str(),
+                                 vram_free_note().c_str());
+                    return 1;
+                }
+        }
+        if (lanes) {
+            // the doorbell variants are captured here by default, so a lane window that runs while a prompt read has
+            // lent experts (or a shrink/swap is in flight) never captures mid-serve; STRATA_LANES_PRECAPTURE_NR=0 leaves
+            // them to the first such window
+            const bool pre_nr = env_on("STRATA_LANES_PRECAPTURE_NR", true);
+            size_t f_bind[2], f_win[2], f_nr[2], f_dr[2];
+            for (int st = 0; st < 2; ++st) f_bind[st] = free_on(lane_dev(st));
+            for (int b = 0; b < 2; ++b)
+                for (int st = 0; st < 2; ++st)
+                    if (!lane_v[b][st].capture_all(err, lane_t)) {
+                        std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's graphs on CUDA%d: %s%s\n", b,
+                                     lane_dev(st), err.c_str(), vram_free_note().c_str());
+                        return 1;
+                    }
+            for (int st = 0; st < 2; ++st) f_win[st] = free_on(lane_dev(st));
+            for (int b = 0; b < 2 && pre_nr; ++b)
+                for (int st = 0; st < 2; ++st)
+                    if (!lane_v[b][st].capture_doorbell(err, lane_t)) {
+                        std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's doorbell graphs on CUDA%d: %s%s\n", b,
+                                     lane_dev(st), err.c_str(), vram_free_note().c_str());
+                        return 1;
+                    }
+            for (int st = 0; st < 2; ++st) f_nr[st] = free_on(lane_dev(st));
+            for (int b = 0; b < 2; ++b)
+                if (!lane_mtp[(size_t) b]->prepare_draft(err, lane_t)) {
+                    std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's drafter graphs: %s%s\n", b, err.c_str(),
+                                 vram_free_note().c_str());
+                    return 1;
+                }
+            for (int st = 0; st < 2; ++st) f_dr[st] = free_on(lane_dev(st));
+            // every expert of each stage resident (GO: the pipelined lanes need the zero-doorbell graphs), and what the
+            // lanes took
+            auto mib = [](int64_t b) { return (double) b / 1048576.0; };
+            bool all_res = true;
+            for (int st = 0; st < 2; ++st) {
+                const int64_t lb = st == 0 ? 0 : stages[0]->lb, le = st == 0 ? split_at[0] : stages[0]->le;
+                int64_t res = 0;
+                for (int64_t l = lb; l < le; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        res += !host_res.empty() && host_res[(size_t) (l * g.n_expert + e)] >= 0;
+                const int64_t pairs = (le - lb) * g.n_expert;
+                all_res = all_res && res == pairs;
+                const int64_t arenas = (int64_t) lane_free0[st] - (int64_t) lane_free1[st];
+                const int64_t bind_b = (int64_t) lane_free_pre_bind[st] - (int64_t) f_bind[st];
+                const int64_t win = (int64_t) f_bind[st] - (int64_t) f_win[st];
+                const int64_t nr = (int64_t) f_win[st] - (int64_t) f_nr[st];
+                const int64_t dr = (int64_t) f_nr[st] - (int64_t) f_dr[st];
+                const int64_t after = arenas + bind_b + win + nr + dr;
+                std::fprintf(stderr, "strata lanes: CUDA%d (stage %d, layers %lld-%lld): experts %lld/%lld resident (%.1f%%), "
+                                     "%.0f MiB free after lane setup; the lanes took %.0f MiB = %.0f before the expert cache "
+                                     "(slot sessions + drafters) + %.0f after it (verifier arenas %.0f, drafter binds %.0f, "
+                                     "window+commit graphs %.0f, doorbell graphs %.0f%s, drafter graphs %.0f)\n",
+                             lane_dev(st), st + 1, (long long) lb, (long long) (le - 1), (long long) res, (long long) pairs,
+                             100.0 * (double) res / (double) std::max<int64_t>(pairs, 1), mib((int64_t) f_dr[st]),
+                             mib(lane_pre_bytes[st] + after), mib(lane_pre_bytes[st]), mib(after), mib(arenas), mib(bind_b),
+                             mib(win), mib(nr), pre_nr ? "" : " (not pre-captured)", mib(dr));
+            }
+            std::fprintf(stderr, "strata lanes: %s: 2 lanes, %d-token MTP windows, zero-doorbell graphs: lane 0 %s/%s, "
+                                 "lane 1 %s/%s\n", all_res ? "GO (every expert resident on both stages)"
+                                                          : "NO-GO (not every expert is resident: both lanes would need the CPU)",
+                         lane_t, lane_v[0][0].all_resident() ? "yes" : "no", lane_v[0][1].all_resident() ? "yes" : "no",
+                         lane_v[1][0].all_resident() ? "yes" : "no", lane_v[1][1].all_resident() ? "yes" : "no");
+            if (lanes_pipe)
+                std::fprintf(stderr, "strata lanes: pipelined (lane_pump; STRATA_LANES_SERIAL=1 for serial lanes): "
+                                     "stage 0 runs one lane's window while stage 1 + the draft run the other's; drafts %s, "
+                                     "drafter streams at %s priority; one lane alone, a prompt read or experts out of VRAM: "
+                                     "serial windows\n", lanes_draft_sync ? "blocking (STRATA_LANES_DRAFT_SYNC=1)" : "polled",
+                             lanes_prio ? "the highest (STRATA_LANES_DRAFT_PRIO=1)" : "the default");
+            else
+                std::fprintf(stderr, "strata lanes: serial (STRATA_LANES_SERIAL=1): the lanes' windows one after the other\n");
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
@@ -8992,7 +9280,10 @@ int main(int argc, char** argv) {
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) +
+                                       // --lanes: the server keeps a lane left alone in its lane (no copy back to the
+                                       // solo path) and runs requests with images solo only
+                                       (o.lanes > 0 ? " lanes=" + std::to_string(o.lanes) : std::string())).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -9264,19 +9555,20 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
-            if (batch_mtp) {
-                // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
-                // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
-                // kernel launch there.
+            if (batch_mtp || lanes) {
+                // Admission first builds the solo draft KV; copy it into the slot before drafting (--lanes: into the
+                // lane's full drafter).  Both drafters' K/V are on the drafter's device (the last stage's GPU with a
+                // layer split): the copy's ring refill is a kernel launch there.
+                strata::core::MtpDrafter& sd = lanes ? *lane_mtp[(size_t) b] : *slot_mtp[(size_t) b];
                 const strata::core::OnDevice on_mtp(mtp.device());
                 strata::core::ConversationKv image;
-                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+                if (!mtp.idle(e) || !sd.idle(e) ||
                     !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+                    !strata::core::conversation_kv_restore(image, sd.kv_state(),
                                                            draft_geometry, upto, false, e) ||
                     cudaDeviceSynchronize() != cudaSuccess)
                     return false;
-                slot_mtp[(size_t) b]->set_prompt_len(upto);
+                sd.set_prompt_len(upto);
             }
             return true;
         };
@@ -9311,12 +9603,13 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
-            if (batch_mtp) {
-                // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
+            if (batch_mtp || lanes) {
+                // A returning solo request resumes from its slot's (lane's) draft KV (on the drafter's device, as above).
+                strata::core::MtpDrafter& sd = lanes ? *lane_mtp[(size_t) b] : *slot_mtp[(size_t) b];
                 const strata::core::OnDevice on_mtp(mtp.device());
                 strata::core::ConversationKv image;
-                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
-                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+                if (!sd.idle(e) || !mtp.idle(e) ||
+                    !strata::core::conversation_kv_save(image, sd.kv_state(),
                                                         draft_geometry, upto, false, e) ||
                     !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
                     cudaDeviceSynchronize() != cudaSuccess)
@@ -9326,9 +9619,439 @@ int main(int argc, char** argv) {
             return true;
         };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+        // ---- --lanes 2: the lanes' decode.  lane_window runs one lane's window serially, lane_pump (below) pipelines the
+        // two lanes across the stages.  A lane's window is the solo decode's (MTP windows only: no lookup drafts, no penalties):
+        // its size from the drafts' probabilities, the lane's verifier chain on its slot sessions, the accepted prefix
+        // committed, the lane's own drafter.  BT / BDONE as batch_step says them.
+        struct LaneState {
+            std::array<int32_t, strata::kernels::kVerifyMaxT> drafts{};
+            std::array<float, strata::kernels::kVerifyMaxT> dprob{};
+            float min_p = 0.0f;
+            // (lane_pump) where the lane's window is.  0 = no window (ready, or idle), 1 = stage 0 in flight,
+            // 2 = stage 0 done (stage 1 not launched yet), 3 = stage 1 in flight, 4 = drafting (draft_begin .. draft_poll)
+            int ph = 0;
+            int T = 0;
+            int64_t p0 = 0;
+            std::array<int32_t, strata::kernels::kVerifyMaxT> win{}, outv{};
+            // host ms stamps of the window: ready (drafts in), stage-0 launch / done, stage-1 launch, draft begin
+            double t_ready = 0, t_l0 = 0, t_d0 = 0, t_l1 = 0, t_dr = 0;
+        };
+        LaneState lst[2];
+        int64_t ln_windows[2] = {0, 0}, ln_tokens[2] = {0, 0}, ln_offered[2] = {0, 0}, ln_accepted[2] = {0, 0};
+        double ln_run = 0, ln_commit = 0, ln_draft = 0;
+        Clock::time_point ln_start = Clock::now();
+        int lane_rr = 0;
+        // the pipelined windows' counters since the lanes were last idle (lane_report)
+        int64_t pp_windows[2] = {0, 0}, pp_tokens[2] = {0, 0}, pp_offered[2] = {0, 0}, pp_accepted[2] = {0, 0};
+        double pp_wall = 0, pp_t_in = 0;            // ms with a pipelined window in flight; when the current stretch began
+        double pp_busy0 = 0, pp_busy1 = 0, pp_dr = 0;   // GPU busy estimates (host stamps): stage 0, stage 1, drafts
+        double pp_last_d0 = 0, pp_last_d1 = 0;      // the last window's completion on each stage stream
+        double pp_s0 = 0, pp_w01 = 0, pp_s1 = 0, pp_lat = 0;   // per window: stage 0 (queue incl.), wait, stage 1, launch->ready
+        auto lane_ms = [] { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); };
+        auto lane_inflight = [&] { return lst[0].ph != 0 || lst[1].ph != 0; };
+        auto lanes_fresh = [&] {
+            return ln_windows[0] + ln_windows[1] + pp_windows[0] + pp_windows[1] == 0 && !lane_inflight();
+        };
+        auto lane_err = [&](int b, const std::string& e) {
+            std::printf("ERR lane %d: %s\n", b, e.c_str());
+            std::fflush(stdout);
+            return false;
+        };
+        auto lane_finish = [&](int b, const char* fin) {
+            BSlot& sl = bs[(size_t) b];
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+            sl.active = false;
+            sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // its sessions hold exactly `ids`
+        };
+        // #879: the lane's last window (committed) had non-finite head logits: none of its tokens goes out, the lane ends
+        // (BDONE nonfinite, not kept as a cache) and the next request reads its prompt from token 0, as a batch slot
+        auto lane_nonfinite = [&](int b, const strata::core::Verifier& v) -> bool {
+            if (v.nonfinite_row() < 0) return false;
+            BSlot& sl = bs[(size_t) b];
+            std::fprintf(stderr, "strata lanes: non-finite logits (#879) in lane %d at position %lld: it ends (BDONE "
+                                 "nonfinite) and the next request reads its prompt from token 0\n", b,
+                         (long long) v.nonfinite_pos());
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+            std::fflush(stdout);
+            sl.active = false;
+            sl.cached = false;
+            sl.checks.clear();
+            nan_flush = true;
+            return true;
+        };
+        // the next window's size from the drafts' probabilities (the solo decode's rule)
+        auto lane_T = [&](const LaneState& L) {
+            int T = lane_t;
+            if (L.min_p > 0.0f) {
+                T = 1;
+                while (T < lane_t && L.dprob[(size_t) T - 1] >= L.min_p) ++T;
+            }
+            return T;
+        };
+        auto lane_window = [&](int b) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            LaneState& L = lst[b];
+            strata::core::Verifier& lv = lane_v[b][0];
+            if (sl.stop) {   // BSTOP before this window (its sessions hold `ids`, its drafts are in)
+                lane_finish(b, "cancel");
+                return true;
+            }
+            const int T = lane_T(L);
+            if (sl.p + T > o.max_context) {   // where the solo decode stops too
+                lane_finish(b, "length");
+                return true;
+            }
+            int32_t window[strata::kernels::kVerifyMaxT] = {}, outv[strata::kernels::kVerifyMaxT] = {};
+            window[0] = sl.x;
+            for (int i = 1; i < T; ++i) window[i] = L.drafts[(size_t) i - 1];
+            drive.d.layers = 0;
+            drive.d.experts = 0;
+            drive.d.failed = false;
+            apply_pending(false);
+            const Clock::time_point w0 = Clock::now();
+            if (!lv.run(T, window, sl.p, &drive_pool_split, &lane_sd[b], outv, err) || drive.d.failed) {
+                std::printf("ERR lane %d: %s\n", b, drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                return false;
+            }
+            int a = 0;
+            while (a < T - 1 && window[a + 1] == outv[a]) ++a;
+            const Clock::time_point w1 = Clock::now();
+            if (!lv.commit(a + 1, err)) {
+                std::printf("ERR lane %d: %s\n", b, err.c_str());
+                return false;
+            }
+            const Clock::time_point w2 = Clock::now();
+            if (lane_nonfinite(b, lv)) {
+                L.t_ready = lane_ms();
+                return true;
+            }
+            ++ln_windows[b];
+            ln_offered[b] += T - 1;
+            ln_accepted[b] += a;
+            const int64_t p0 = sl.p;
+            for (int i = 0; i <= a; ++i) sl.ids.push_back(window[i]);   // what the lane's sessions hold now
+            sl.p += a + 1;
+            sl.x = outv[a];
+            const char* fin = nullptr;
+            for (int i = 0; i <= a && fin == nullptr; ++i) {
+                const int32_t y = outv[i];
+                std::printf("BT %d %d\n", b, (int) y);
+                ++sl.produced;
+                ++ln_tokens[b];
+                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                fin = eos ? "stop" : sl.produced >= sl.max_new ? "length" : nullptr;
+            }
+            if (fin == nullptr && sl.stop) fin = "cancel";
+            if (fin != nullptr) {
+                lane_finish(b, fin);
+            } else if (!lane_mtp[(size_t) b]->draft(T, outv, p0, a, L.drafts.data(), err, L.dprob.data(), L.min_p)) {
+                std::printf("ERR lane %d's drafter: %s\n", b, err.c_str());
+                return false;
+            }
+            auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+            ln_run += msd(w0, w1);
+            ln_commit += msd(w1, w2);
+            ln_draft += msd(w2, Clock::now());
+            L.t_ready = lane_ms();
+            return true;
+        };
+        // the summary when both lanes are idle: the serial line (STRATA_LANES_SERIAL=1), or the pipelined line
+        auto lane_report = [&]() {
+            const int64_t ws = ln_windows[0] + ln_windows[1], wp = pp_windows[0] + pp_windows[1];
+            if (ws + wp == 0 || lane_inflight()) return;
+            const double wall = std::chrono::duration<double, std::milli>(Clock::now() - ln_start).count();
+            auto per_lane = [](const int64_t* w, const int64_t* tk, const int64_t* acc, const int64_t* off) {
+                std::string per;
+                for (int b = 0; b < 2; ++b) {
+                    char t[200];
+                    std::snprintf(t, sizeof t, "%slane %d: %lld windows, %lld tokens, drafts accepted %lld of %lld, %.2f "
+                                  "tokens/window", b ? "; " : "", b, (long long) w[b], (long long) tk[b],
+                                  (long long) acc[b], (long long) off[b],
+                                  w[b] > 0 ? (double) (acc[b] + w[b]) / (double) w[b] : 0.0);
+                    per += t;
+                }
+                return per;
+            };
+            const long long f0 = (long long) (free_on(lane_dev(0)) >> 20), f1 = (long long) (free_on(lane_dev(1)) >> 20);
+            if (!lanes_pipe) {
+                const double tw = (double) ws;
+                std::fprintf(stderr, "strata lanes (serial): %s; %.2f ms/window = run %.2f + commit %.2f + emit/draft %.2f; "
+                                     "%.1f tokens/s together over %.0f ms of wall time (admissions included); VRAM free now "
+                                     "CUDA%d %lld MiB, CUDA%d %lld MiB\n",
+                             per_lane(ln_windows, ln_tokens, ln_accepted, ln_offered).c_str(),
+                             (ln_run + ln_commit + ln_draft) / tw, ln_run / tw, ln_commit / tw, ln_draft / tw,
+                             1000.0 * (double) (ln_tokens[0] + ln_tokens[1]) / std::max(wall, 1e-9), wall,
+                             lane_dev(0), f0, lane_dev(1), f1);
+            } else {
+                const double w = (double) std::max<int64_t>(wp, 1), pw = std::max(pp_wall, 1e-9);
+                const int64_t tok = pp_tokens[0] + pp_tokens[1] + ln_tokens[0] + ln_tokens[1];
+                std::fprintf(stderr, "strata lanes (pipelined): %s; cycle %.2f ms (one window of each lane: %lld windows in "
+                                     "%.0f ms with windows in flight, %.2f ms per window), lane window %.2f ms = stage 0 %.2f "
+                                     "(queue incl.) + wait %.2f + stage 1 %.2f + picks/draft %.2f (stage-0 launch to the next "
+                                     "drafts); GPU busy (host stamps, commits not counted): CUDA%d %.0f%%, CUDA%d %.0f%% stage 1 "
+                                     "+ %.0f%% drafts (beside the other lane's stage 1); %.1f tokens/s while pipelined; serial "
+                                     "windows %lld + %lld (one lane alone, experts out of VRAM, prompt reads), %lld tokens; "
+                                     "%.1f tokens/s together over %.0f ms of wall time (admissions included); VRAM free now "
+                                     "CUDA%d %lld MiB, CUDA%d %lld MiB\n",
+                             per_lane(pp_windows, pp_tokens, pp_accepted, pp_offered).c_str(), 2.0 * pw / w,
+                             (long long) wp, pw, pw / w, pp_lat / w, pp_s0 / w, pp_w01 / w, pp_s1 / w,
+                             (pp_lat - pp_s0 - pp_w01 - pp_s1) / w, lane_dev(0), 100.0 * pp_busy0 / pw, lane_dev(1),
+                             100.0 * pp_busy1 / pw, 100.0 * pp_dr / pw,
+                             1000.0 * (double) (pp_tokens[0] + pp_tokens[1]) / pw, (long long) ln_windows[0],
+                             (long long) ln_windows[1], (long long) (ln_tokens[0] + ln_tokens[1]),
+                             1000.0 * (double) tok / std::max(wall, 1e-9), wall, lane_dev(0), f0, lane_dev(1), f1);
+            }
+            for (int b = 0; b < 2; ++b)
+                for (int st = 0; st < 2; ++st) {
+                    const std::string pr = lane_v[b][st].profile_report();
+                    if (!pr.empty())
+                        std::fprintf(stderr, "strata lanes GPU stages, lane %d stage %d (ms/window):%s\n", b, st + 1, pr.c_str());
+                }
+            for (int b = 0; b < 2; ++b) {
+                ln_windows[b] = ln_tokens[b] = ln_offered[b] = ln_accepted[b] = 0;
+                pp_windows[b] = pp_tokens[b] = pp_offered[b] = pp_accepted[b] = 0;
+            }
+            ln_run = ln_commit = ln_draft = 0;
+            pp_wall = pp_busy0 = pp_busy1 = pp_dr = pp_s0 = pp_w01 = pp_s1 = pp_lat = 0;
+        };
+        // ---- lane_pump: the two lanes pipelined across the stages.  Stage 0 (CUDA0) runs one lane's window while
+        // stage 1 (CUDA1) runs the other's and then its drafter, so each card holds one lane's work at a time.  The same
+        // window graphs as run() (the zero-doorbell exec_[T]) on the same sessions, driven without blocking: pl_launch +
+        // service (the PLE rows, flag 1), done (an event query), pl_finish (the picks), pl_commit_async on both stages,
+        // then the drafter (draft_begin / draft_poll; STRATA_LANES_DRAFT_SYNC=1: draft()).  The stage hand-off is the
+        // lane's own (host-mediated: stage 1 launches after stage 0's event).  Ordering rules:
+        //   - stage 0: a ready lane's window queues behind the other lane's on the shared stage-0 stream (its pl_finish
+        //     never syncs that stream), the longest-ready lane first;
+        //   - stage 1: at most one window in flight (each lane's verifier has its own stream there): CUDA1 runs the stage-1
+        //     windows in turn, and a sampled lane's pl_finish (which samples on its stream and syncs it) never waits for the
+        //     other lane's window;
+        //   - a lane's draft is launched before the other lane's stage-1 window (both on CUDA1, the draft on the drafter's
+        //     own stream), since the lane's next stage-0 window waits for it.
+        // A lane's tokens are its solo tokens: each window is the solo window on the lane's sessions, the lanes share no
+        // mutable state, and only the host's order of launches differs from the serial lanes.
+        auto lane_s1_done = [&](int b, std::string& le) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            LaneState& L = lst[b];
+            if (!lane_v[b][1].pl_finish(L.outv.data(), le)) return lane_err(b, le);
+            const int T = L.T;
+            int a = 0;
+            while (a < T - 1 && L.win[(size_t) a + 1] == L.outv[(size_t) a]) ++a;
+            // both stages keep the accepted prefix (nothing chains through next_ here).  Stage 0's commit queues behind
+            // the other lane's stage-0 window and advances ple_prev now, which the lane's next stage-0 window and its
+            // drafter's PLE prefetch read.
+            if (!lane_v[b][1].pl_commit_async(a + 1, le) || !lane_v[b][0].pl_commit_async(a + 1, le)) return lane_err(b, le);
+            if (lane_nonfinite(b, lane_v[b][1])) {
+                L.ph = 0;
+                return true;
+            }
+            ++pp_windows[b];
+            pp_offered[b] += T - 1;
+            pp_accepted[b] += a;
+            for (int i = 0; i <= a; ++i) sl.ids.push_back(L.win[(size_t) i]);   // what the lane's sessions hold now
+            sl.p += a + 1;
+            sl.x = L.outv[(size_t) a];
+            const char* fin = nullptr;
+            for (int i = 0; i <= a && fin == nullptr; ++i) {
+                const int32_t y = L.outv[(size_t) i];
+                std::printf("BT %d %d\n", b, (int) y);
+                ++sl.produced;
+                ++pp_tokens[b];
+                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                fin = eos ? "stop" : sl.produced >= sl.max_new ? "length" : nullptr;
+            }
+            if (fin == nullptr && sl.stop) fin = "cancel";
+            if (fin != nullptr) {
+                lane_finish(b, fin);
+                std::fflush(stdout);
+                L.ph = 0;
+                return true;
+            }
+            std::fflush(stdout);
+            L.t_dr = lane_ms();
+            if (lanes_draft_sync) {
+                if (!lane_mtp[(size_t) b]->draft(T, L.outv.data(), L.p0, a, L.drafts.data(), le, L.dprob.data(), L.min_p))
+                    return lane_err(b, "the drafter: " + le);
+                const double t = lane_ms();
+                pp_dr += t - L.t_dr;
+                pp_lat += t - L.t_l0;
+                L.t_ready = t;
+                L.ph = 0;
+            } else {
+                if (!lane_mtp[(size_t) b]->draft_begin(T, L.outv.data(), L.p0, a, L.min_p, le))
+                    return lane_err(b, "the drafter: " + le);
+                L.ph = 4;
+            }
+            return true;
+        };
+        // one turn: every completion handled (stage 0, stage 1, drafts), then stage 1's next window, then (`may_start`)
+        // the ready lanes' stage-0 windows.  Never blocks (except STRATA_LANES_DRAFT_SYNC's draft).
+        auto lane_advance = [&](bool may_start) -> bool {
+            std::string le;
+            const bool was_in = lane_inflight();
+            bool moved = false;
+            const int first = lst[1].t_l0 < lst[0].t_l0 ? 1 : 0;   // a stream completes in launch order
+            for (int j = 0; j < 2; ++j) {
+                const int b = (first + j) % 2;
+                LaneState& L = lst[b];
+                if (L.ph != 1) continue;
+                strata::core::Verifier& v = lane_v[b][0];
+                if (v.service(&drive_pool_split, &lane_sd[b], le) < 0) return lane_err(b, le);
+                if (!v.done(le)) {
+                    if (!le.empty()) return lane_err(b, le);
+                    continue;
+                }
+                if (!v.pl_finish(nullptr, le)) return lane_err(b, le);
+                const double t = lane_ms();
+                pp_busy0 += t - std::max(L.t_l0, pp_last_d0);
+                pp_last_d0 = t;
+                pp_s0 += t - L.t_l0;
+                L.t_d0 = t;
+                L.ph = 2;
+                moved = true;
+            }
+            for (int b = 0; b < 2; ++b) {
+                LaneState& L = lst[b];
+                if (L.ph != 3) continue;
+                strata::core::Verifier& v = lane_v[b][1];
+                if (v.service(&drive_pool_split, &lane_sd[b], le) < 0) return lane_err(b, le);
+                if (!v.done(le)) {
+                    if (!le.empty()) return lane_err(b, le);
+                    continue;
+                }
+                const double t = lane_ms();
+                pp_busy1 += t - std::max(L.t_l1, pp_last_d1);
+                pp_last_d1 = t;
+                pp_s1 += t - L.t_l1;
+                if (!lane_s1_done(b, le)) return false;   // picks, commits, BT / BDONE, then the draft
+                moved = true;
+            }
+            for (int b = 0; b < 2; ++b) {
+                LaneState& L = lst[b];
+                if (L.ph != 4) continue;
+                const int r = lane_mtp[(size_t) b]->draft_poll(L.drafts.data(), L.dprob.data(), nullptr, le);
+                if (r < 0) return lane_err(b, "the drafter: " + le);
+                if (r == 0) continue;
+                const double t = lane_ms();
+                pp_dr += t - L.t_dr;
+                pp_lat += t - L.t_l0;
+                L.t_ready = t;
+                L.ph = 0;
+                moved = true;
+            }
+            // stage 1: the lane whose stage 0 finished first, when no stage-1 window is in flight
+            if (lst[0].ph != 3 && lst[1].ph != 3) {
+                int pick = -1;
+                for (int b = 0; b < 2; ++b)
+                    if (lst[b].ph == 2 && (pick < 0 || lst[b].t_d0 < lst[pick].t_d0)) pick = b;
+                if (pick >= 0) {
+                    LaneState& L = lst[pick];
+                    strata::core::Verifier& v = lane_v[pick][1];
+                    if (!v.pl_launch(L.T, L.win.data(), L.p0, le) || v.service(&drive_pool_split, &lane_sd[pick], le) < 0)
+                        return lane_err(pick, le);
+                    L.t_l1 = lane_ms();
+                    pp_w01 += L.t_l1 - L.t_d0;
+                    L.ph = 3;
+                    moved = true;
+                }
+            }
+            // stage 0: the ready lanes, the longest-ready first; a window whose experts are not all in VRAM is left to the
+            // serial path (pl_launch launches the zero-doorbell graph only)
+            if (may_start) {
+                const int fr = lst[1].t_ready < lst[0].t_ready ? 1 : 0;
+                for (int j = 0; j < 2; ++j) {
+                    const int b = (fr + j) % 2;
+                    BSlot& sl = bs[(size_t) b];
+                    LaneState& L = lst[b];
+                    if (!sl.active || L.ph != 0) continue;
+                    if (sl.stop) {   // a BSTOP that came while the lane drafted ends it here, not a window later
+                        lane_finish(b, "cancel");
+                        std::fflush(stdout);
+                        moved = true;
+                        continue;
+                    }
+                    const int T = lane_T(L);
+                    if (sl.p + T > o.max_context) {   // where the solo decode stops too
+                        lane_finish(b, "length");
+                        std::fflush(stdout);
+                        moved = true;
+                        continue;
+                    }
+                    if (!lane_v[b][0].resident_now() || !lane_v[b][1].resident_now()) continue;
+                    if (lanes_fresh()) ln_start = Clock::now();
+                    L.T = T;
+                    L.p0 = sl.p;
+                    L.win[0] = sl.x;
+                    for (int i = 1; i < T; ++i) L.win[(size_t) i] = L.drafts[(size_t) i - 1];
+                    strata::core::Verifier& v = lane_v[b][0];
+                    if (!v.pl_launch(T, L.win.data(), L.p0, le) || v.service(&drive_pool_split, &lane_sd[b], le) < 0)
+                        return lane_err(b, le);
+                    L.t_l0 = lane_ms();
+                    L.ph = 1;
+                    moved = true;
+                }
+            }
+            if (drive.d.failed) return lane_err(0, drive.d.fail ? drive.d.fail : "the expert pool failed");
+            const bool now_in = lane_inflight();
+            if (!was_in && now_in) pp_t_in = lane_ms();
+            else if (was_in && !now_in) pp_wall += lane_ms() - pp_t_in;
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+            if (!moved) __builtin_ia32_pause();
+#endif
+            return true;
+        };
+        // every window in flight finished (no new stage-0 window), and the pipelined commits landed: before the serve
+        // loop handles any line but BSTOP / BYIELD (a prompt read, a solo request, VRAM, ...), and before serial windows
+        auto lane_drain = [&]() -> bool {
+            while (lane_inflight())
+                if (!lane_advance(false)) return false;
+            std::string le;
+            for (int b = 0; b < 2; ++b)
+                for (int st = 0; st < 2; ++st)
+                    if (!lane_v[b][st].pl_wait_commit(le)) return lane_err(b, le);
+            if (!batch_on()) lane_report();
+            strata::core::progress().busy.store(false);   // (the serve loop's request scope sets it again)
+            return true;
+        };
+        // the serial lanes: one solo window per active lane per call, the lanes in turn.  With STRATA_LANES_SERIAL=1 every
+        // lane window runs here; pipelined, the windows of one lane alone (and between prompt chunks, experts out of VRAM)
+        auto lane_step = [&]() -> bool {
+            if (lane_inflight() && !lane_drain()) return false;
+            if (lanes_fresh()) ln_start = Clock::now();
+            const bool was_busy = strata::core::progress().busy.load();
+            strata::core::progress().busy.store(true);
+            for (int j = 0; j < 2; ++j) {
+                const int b = (lane_rr + j) % 2;
+                if (bs[(size_t) b].active && !lane_window(b)) return false;
+            }
+            lane_rr ^= 1;
+            std::fflush(stdout);
+            strata::core::progress().busy.store(was_busy);
+            if (!batch_on()) lane_report();
+            return true;
+        };
+        // the serve loop's turn with lanes pipelined: both lanes active, every expert in VRAM -> the pipeline; otherwise
+        // (one lane alone, or experts out of VRAM) a serial window, once nothing is in flight
+        auto lane_pump = [&]() -> bool {
+            const bool both = bs[0].active && bs[1].active;
+            if (!lane_inflight()) {
+                drive.d.failed = false;
+                apply_pending(false);   // the tier's landed swaps (between windows only: nothing in flight)
+                bool go = both;
+                for (int b = 0; b < 2 && go; ++b)
+                    for (int st = 0; st < 2 && go; ++st) go = lane_v[b][st].resident_now();
+                if (!go) return lane_step();
+            }
+            if (!lane_advance(both)) return false;
+            if (!lane_inflight() && !batch_on()) lane_report();
+            strata::core::progress().busy.store(lane_inflight());   // the watchdog: a window in flight is a request
+            return true;
+        };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
+            if (lanes) return lane_step();   // --lanes 2: the slots decode as lanes (both callers of batch_step)
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
@@ -9693,13 +10416,16 @@ int main(int argc, char** argv) {
             return true;
         };
         for (;;) {
-            if (batch_on() || (piped && pipe_inflight())) {
+            if (batch_on() || (piped && pipe_inflight()) || (lanes_pipe && lane_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(piped ? pump(true) : batch_step())) return 1;
+                    // (lanes pipelined: lane_pump; read_part's batch_step stays serial - a prompt loan may be out there)
+                    if (!(lanes_pipe ? lane_pump() : piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
                 if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
+                // (lanes: every window in flight finishes first; BSTOP ends its lane after the window in flight)
+                if (lanes_pipe && line.rfind("BSTOP ", 0) != 0 && line.rfind("BYIELD", 0) != 0 && !lane_drain()) return 1;
             } else if (!next_line(line)) {
                 break;
             }
@@ -9734,6 +10460,11 @@ int main(int argc, char** argv) {
                 const long long mn = std::strtoll(e1, &e2, 10);
                 if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1) {
                     std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", o.batch);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (bimg && lanes) {   // --lanes: one M-RoPE table per device, rewritten per request
+                    std::printf("ERR BGENI: requests with images run solo when lanes are on (GENI), not in a lane\n");
                     std::fflush(stdout);
                     continue;
                 }
@@ -12238,6 +12969,19 @@ int main(int argc, char** argv) {
                             return 1;
                         }
                         sl.draft_ready = true;
+                    }
+                    if (lanes) {   // the lane continues as the solo decode would: its sampling, its drafter's first round
+                        LaneState& L = lst[admit_slot];
+                        L = LaneState{};
+                        L.min_p = (float) req_spec_min_p;
+                        lane_v[admit_slot][0].set_sampling(req_sp);   // (reaches its stage-1 verifier)
+                        lane_v[admit_slot][0].set_history(nullptr, 0);   // penalties are not applied in lanes (as batch slots)
+                        for (int st = 0; st < split_drive.n; ++st) lane_sd[admit_slot].pcie_num[st] = split_drive.pcie_num[st];
+                        if (!lane_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x, sl.p - 1, L.drafts.data(),
+                                                                        err, L.dprob.data(), L.min_p)) {
+                            std::fprintf(stderr, "strata lanes: lane %d's first draft failed: %s\n", admit_slot, err.c_str());
+                            return 1;
+                        }
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached

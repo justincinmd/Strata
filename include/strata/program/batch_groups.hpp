@@ -5,7 +5,9 @@
 // `--batch-groups` at all means `auto`.  The pipelined path does not run `--batch-mtp`'s drafts or the batch
 // adaptive tier (`--adapt-async 1` between batch windows), so when one of those is asked for and the number of groups
 // was NOT given, `auto` resolves to one group (the serial windows they run in) and says why.  A number or `auto`
-// given on the command line is honoured as before.
+// given on the command line is honoured as before.  `--lanes 2` replaces the batch windows altogether (each slot is a
+// lane with its own verifiers and drafter); the default gives way to it the same way, and generate.cpp turns the lanes
+// off when a number above 1 or `auto` was given.
 //
 // Pure (no GPU, no environment read): generate.cpp passes in what it knows.
 #pragma once
@@ -13,7 +15,7 @@
 namespace strata::program::batch_groups {
 
 /// What kept `auto` from pipelining.
-enum class Serial { None, BatchMtp, AdaptAsync };
+enum class Serial { None, BatchMtp, AdaptAsync, Lanes };
 
 struct Input {
     bool set = false;          ///< --batch-groups was given (a number or `auto`)
@@ -23,6 +25,7 @@ struct Input {
     int later_stages = 0;      ///< the layer split's stages after CUDA0 (0: no layer split)
     bool batch_mtp = false;    ///< --batch-mtp is on (it passed the gates that do not concern the groups)
     bool adapt_async = false;  ///< --adapt-async 1 was asked for
+    bool lanes = false;        ///< --lanes 2 is on (it passed its gates)
 };
 
 struct Result {
@@ -51,7 +54,8 @@ inline Result resolve(const Input& in) {
     r.would_be = auto_groups(in.later_stages, in.batch);
     r.groups = r.would_be;
     if (!in.set && r.would_be > 1) {   // only the default gives way; `--batch-groups auto` asked for the pipeline
-        if (in.batch_mtp) r.serial = Serial::BatchMtp;
+        if (in.lanes) r.serial = Serial::Lanes;
+        else if (in.batch_mtp) r.serial = Serial::BatchMtp;
         else if (in.adapt_async) r.serial = Serial::AdaptAsync;
         if (r.serial != Serial::None) r.groups = 1;
     }
@@ -59,7 +63,8 @@ inline Result resolve(const Input& in) {
 }
 
 inline const char* serial_what(Serial s) {
-    return s == Serial::BatchMtp ? "--batch-mtp" : s == Serial::AdaptAsync ? "--adapt-async 1" : "";
+    return s == Serial::BatchMtp ? "--batch-mtp" : s == Serial::AdaptAsync ? "--adapt-async 1"
+         : s == Serial::Lanes ? "--lanes 2" : "";
 }
 
 }  // namespace strata::program::batch_groups

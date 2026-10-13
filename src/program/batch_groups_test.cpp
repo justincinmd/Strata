@@ -4,7 +4,8 @@
 //   2. a layer split with --batch >= 2 and no --batch-groups means `auto` (0.1.41);
 //   3. --batch-mtp (or --adapt-async 1) turns that default into one group, and says which feature did it;
 //   4. a number or `auto` given explicitly is honoured, with or without those features;
-//   5. no layer split: the number given (1) stays.
+//   5. no layer split: the number given (1) stays;
+//   6. --lanes 2 turns the default into one group and is named before --batch-mtp / --adapt-async.
 #include "strata/program/batch_groups.hpp"
 
 #include <cstdio>
@@ -65,6 +66,15 @@ int main() {
         i.batch_mtp = true;
         i.adapt_async = true;
         check(bg::resolve(i).serial == bg::Serial::BatchMtp, "both: --batch-mtp is named");
+    }
+    {   // --lanes 2 (two lanes on a two-GPU split): the default gives way to it
+        bg::Input i = in(2, 1);
+        i.lanes = true;
+        const auto r = bg::resolve(i);
+        check(r.groups == 1 && r.from_auto && r.serial == bg::Serial::Lanes && r.would_be == 2,
+              "--lanes 2, nothing given: one group, because of --lanes");
+        i.adapt_async = true;
+        check(bg::resolve(i).serial == bg::Serial::Lanes, "--lanes 2 with --adapt-async 1: --lanes is named");
     }
     {   // nothing to give way: the slots do not divide, so auto is one group anyway and there is nothing to say
         bg::Input i = in(3, 1);
