@@ -1338,13 +1338,18 @@ class StrataEngine:
                 # needs no control lines), so the request keeps the lines while it waits and no new request takes a
                 # lane meanwhile.  But a read that gave way (BYIELD) waits in its lane for the lines to go on: then they
                 # are given back until it has them, taken again, and the lanes checked again (else a deadlock).
+                # A busy flag that nobody owns (#1603) is given back after ORPHAN_SLOT_S, as for a text admission: no
+                # BDONE would ever clear it, and this request holds the lines the admission path's check needs.
                 while solo_only:
                     with self.slot_cv:
                         if not any(self.slot_busy):
                             break
                         parked = bool(self.slot_parked)
                         if not parked:
-                            self.slot_cv.wait(timeout=5.0)
+                            self._reap_orphan_slots()
+                            if not any(self.slot_busy):
+                                break
+                            self.slot_cv.wait(timeout=1.0)
                     if parked:
                         if holding:
                             self.ctl.release()

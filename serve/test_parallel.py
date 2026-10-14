@@ -856,6 +856,52 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(e.admitting, 0)
         self.assertEqual(e.slot_claims, set())
 
+    def test_lanes_a_leaked_busy_lane_does_not_hang_an_image_request(self):
+        """#1603 with --lanes (review finding): an image request waits for every lane to be idle while it holds the
+        control lines.  A lane whose busy flag has no owner (and no parked read) kept it waiting forever, and the lines
+        it held kept every later request away from the admission path's leak check.  The image request now gives such a
+        flag back after ORPHAN_SLOT_S itself, runs GENI and releases the lines."""
+        self.start(2, lanes=True)
+        e = self.engine
+        e.ORPHAN_SLOT_S = 0.4
+        with e.slot_cv:
+            e.slot_busy[0] = True                        # the leak: busy, claimed by nobody, nothing ending it
+        cancel = threading.Event()
+        out, done, _ = self.drive(e.generate_batched(list(b"see this"), 16, {}, cancel, embeddings="IMG"))
+        finished = done.wait(20)
+        cancel.set()
+        self.assertTrue(finished, "the image request hung on a lane nobody owns")
+        self.assertEqual(bytes(t for t in out if isinstance(t, int) and t < 256), b"ok, done.", out)
+        self.assertTrue(any(x.startswith("GENI ") for x in self.log.read_text().splitlines()))
+        self.assertFalse(any(e.slot_busy))
+        self.assertEqual(e.slot_claims, set())
+        self.assertTrue(e.ctl.acquire(timeout=5))       # it gave the control lines back at the end
+        e.ctl.release()
+
+    def test_lanes_an_image_request_waits_for_an_owned_lane(self):
+        """The image request's leak check takes only ownerless flags: a lane a request holds (claimed, not parked)
+        stays busy however long the grace, and the image request runs GENI only after that lane ends."""
+        self.start(2, lanes=True)
+        e = self.engine
+        e.ORPHAN_SLOT_S = 0.0
+        with e.slot_cv:
+            e.slot_busy[0] = True
+            e.slot_claims.add(0)                         # a decoding lane: its request owns it
+        cancel = threading.Event()
+        out, done, _ = self.drive(e.generate_batched(list(b"see this"), 16, {}, cancel, embeddings="IMG"))
+        try:
+            time.sleep(1.5)                              # more than one wait round of the image request
+            self.assertFalse(done.is_set(), "the image request ran beside an owned lane")
+            self.assertTrue(e.slot_busy[0], "an owned lane was taken as a leak")
+            with e.slot_cv:                              # the lane's request ends
+                e.slot_busy[0] = False
+                e.slot_claims.discard(0)
+                e.slot_cv.notify_all()
+            self.assertTrue(done.wait(20), "the image request never ran after the lane ended")
+        finally:
+            cancel.set()
+        self.assertEqual(bytes(t for t in out if isinstance(t, int) and t < 256), b"ok, done.", out)
+
     def test_an_owned_busy_slot_is_never_taken(self):
         """The leak check frees only slots with no owner: a slot a request holds stays busy however long it waits."""
         self.start(2)

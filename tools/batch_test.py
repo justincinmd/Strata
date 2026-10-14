@@ -6,7 +6,9 @@ windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints 
       --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
 
 The same test covers the dual lanes (docs/BATCHING.md "Dual lanes"): each slot then decodes as a solo request.  The
-lanes are asked for by a config with "lanes": 2 (as the server), by --lanes 2 in --extra, or by --env STRATA_LANES=2.
+lanes are asked for by a config with "lanes": 2 (as the server) or --lanes 2 in its "args", by --lanes 2 in --extra,
+or by STRATA_LANES=2 (--env, the config's env with --config-env, or the shell); the engine's precedence decides (the
+last --lanes N, then the larger of that and STRATA_LANES).
 Then --batch and --n default to 2, and the test fails (exit 3) unless the engine's INFO line says lanes=2 (an engine
 that turns the lanes off says why in its log: "WARNING: --lanes is off: ...").  For a two-GPU config:
 
@@ -17,7 +19,7 @@ that turns the lanes off says why in its log: "WARNING: --lanes is off: ...").  
 resident, which the pipelined lanes need: the log's "strata lanes: GO" line.)  In every mode the prompt count must not
 exceed the engine's batch_slots.
 """
-import argparse, json, os, subprocess, sys, tempfile, threading, time
+import argparse, json, os, re, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -46,16 +48,40 @@ def tokenizer(path):
     return ST.Tokenizer(tokens, merges, types)
 
 
+def engine_args(cfg, batch, extra_args):
+    """The engine's arguments after --serve, in order: the config's "args", the layer split, --batch, the server's
+    "lanes": 2, then --extra."""
+    args = list(cfg.get("args") or [])
+    if len(cfg.get("gpu") or []) > 1:
+        args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
+    if batch:
+        args += ["--batch", str(batch)]
+    if cfg.get("lanes") == 2 and "--lanes" not in args:   # the server's "lanes": 2
+        args += ["--lanes", "2"]
+    return args + list(extra_args)
+
+
+def atoi(x):
+    """C's atoi, as the engine reads its numbers: the leading digits (with a sign), else 0."""
+    m = re.match(r"\s*([+-]?\d+)", str(x or ""))
+    return int(m.group(1)) if m else 0
+
+
+def lanes_wanted(args, env):
+    """Whether the engine is asked for the dual lanes, with its precedence: the last --lanes N in its arguments, then
+    the larger of that and a non-empty STRATA_LANES in its environment; N >= 2."""
+    want = 0
+    for i, x in enumerate(args[:-1]):
+        if x == "--lanes":
+            want = atoi(args[i + 1])
+    if env.get("STRATA_LANES"):
+        want = max(want, atoi(env["STRATA_LANES"]))
+    return want >= 2
+
+
 class Engine:
     def __init__(self, exe, cfg, batch, extra_env, extra_args):
-        args = list(cfg["args"])
-        if len(cfg.get("gpu") or []) > 1:
-            args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
-        if batch:
-            args += ["--batch", str(batch)]
-        if cfg.get("lanes") == 2 and "--lanes" not in args:   # the server's "lanes": 2
-            args += ["--lanes", "2"]
-        args += extra_args
+        args = engine_args(cfg, batch, extra_args)
         env = dict(os.environ, **extra_env)
         env["LD_LIBRARY_PATH"] = ":".join(cfg.get("lib_dirs", []) + [env.get("LD_LIBRARY_PATH", "")])
         if os.name == "nt":
@@ -110,16 +136,10 @@ def main():
     for kv in a.env:
         k, _, v = kv.partition("=")
         env[k] = v
-    # the dual lanes are asked for (as the engine reads it: --lanes N or STRATA_LANES=N, N >= 2; the config's "lanes": 2)
+    # the dual lanes are asked for: read from the engine's whole argument list (the config's "args" and "lanes": 2, then
+    # --extra) and its environment, as the engine reads them (--batch does not change it)
     extra = a.extra.split()
-    def as_int(x):
-        try:
-            return int(x)
-        except (TypeError, ValueError):
-            return 0
-    lanes_flag = max([as_int(extra[i + 1]) for i, x in enumerate(extra[:-1]) if x == "--lanes"] or [0])
-    lanes_env = as_int(env.get("STRATA_LANES", os.environ.get("STRATA_LANES")))
-    want_lanes = cfg.get("lanes") == 2 or lanes_flag >= 2 or lanes_env >= 2
+    want_lanes = lanes_wanted(engine_args(cfg, None, extra), dict(os.environ, **env))
     if a.batch is None:
         a.batch = 2 if want_lanes else 4
     if a.n is None:
@@ -151,7 +171,7 @@ def main():
         eng.send("QUIT")
         eng.p.wait(timeout=180)
         return 3
-    slots = as_int(eng.info.get("batch_slots"))
+    slots = atoi(eng.info.get("batch_slots"))
     print(f"engine: batch_slots={slots} batch_groups={eng.info.get('batch_groups', '-')} "
           f"lanes={eng.info.get('lanes', '0')}", flush=True)
     if len(prompts) > slots:
