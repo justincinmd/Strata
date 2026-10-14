@@ -7,10 +7,12 @@
 // was NOT given, `auto` resolves to one group (the serial windows they run in) and says why.  A number or `auto`
 // given on the command line is honoured as before.  `--lanes 2` replaces the batch windows altogether (each slot is a
 // lane with its own verifiers and drafter); the default gives way to it the same way, and generate.cpp turns the lanes
-// off when a number above 1 or `auto` was given.
+// off when a number above 1 or `auto` was given.  `lane_windows` is the lanes' MTP window cap (the solo decode's).
 //
 // Pure (no GPU, no environment read): generate.cpp passes in what it knows.
 #pragma once
+
+#include <algorithm>
 
 namespace strata::program::batch_groups {
 
@@ -60,6 +62,22 @@ inline Result resolve(const Input& in) {
         if (r.serial != Serial::None) r.groups = 1;
     }
     return r;
+}
+
+/// --lanes 2: a lane's MTP windows.  `cap` is the solo decode's cap (its S_mtp: --mtp-max-t when given, at most --spec;
+/// else --spec), so `--mtp-max-t 1` gives one-token windows (no drafts) in a lane as in the solo path.  `capture` is
+/// how many window sizes the lane verifiers and drafters capture at start-up: at least 2, as before the cap could be 1
+/// (the verifiers' allocation is sized from --spec / --batch at init, not from this).
+struct LaneWindows {
+    int cap = 1;
+    int capture = 2;
+};
+
+inline LaneWindows lane_windows(int spec, int mtp_max_t) {
+    LaneWindows w;
+    w.cap = std::max(1, mtp_max_t > 0 ? std::min(mtp_max_t, spec) : spec);
+    w.capture = std::max(2, w.cap);
+    return w;
 }
 
 inline const char* serial_what(Serial s) {

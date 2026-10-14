@@ -267,7 +267,8 @@ per card.
 On a layer split into two stages on two GPUs, `--lanes 2` turns the two batch slots into two **lanes**. A lane
 decodes a request the way the solo path does: its own verifier on each stage (on the slot's sessions, with its own
 hand-off), its own full MTP drafter on the last stage (the solo drafter's weights and draft head, its own K/V), and
-the solo window graphs (zero-doorbell, MTP windows of up to `--mtp-max-t` tokens). With both lanes busy, `lane_pump`
+the solo window graphs (zero-doorbell, MTP windows of up to `--mtp-max-t` tokens, at most `--spec`; `--mtp-max-t 1`
+gives one-token windows without drafts, as in the solo path). With both lanes busy, `lane_pump`
 pipelines them across the cards: GPU 0 runs lane A's stage-0 window while GPU 1 runs lane B's stage-1 window and then
 B's draft. Batch slots, by contrast, either decode one token per slot per window (serial, or pipelined
 `--batch-groups`, which drop the MTP drafts) or verify one MTP proposal per slot (`--batch-mtp`, serial stages).
@@ -295,6 +296,9 @@ Server: `STRATA_PARALLEL_SOLO=1` sends a lane left alone back to the solo path (
 lane alone already runs the solo window).
 
 Limits: two lanes on two stages only; no penalties and no lookup / suffix drafts in a lane (as in batch slots);
+a lane drafts argmax tokens: coupled draft sampling (`--coupled-draft`, `STRATA_SPEC_COUPLED=1`) and
+`STRATA_SPEC_PROB=1` apply to the solo path only, and the engine says so once at start-up (the lane drafters' graphs
+are captured at start-up in argmax mode, as `--batch-mtp`'s slot drafters never sample either);
 requests with pictures run solo, after the lanes are idle (one M-RoPE table per device), and a prompt read does not
 give way to them; the adaptive VRAM tier does not run between lane windows (the GO condition has every expert
 resident). The lane verifiers are set up as `--pipeline-windows`' verifiers are (`set_always_publish`): a one-token
@@ -308,9 +312,32 @@ no prompt read lends experts meanwhile. This was checked only on HIP: 2x Radeon 
 tokens per lane) and seeded sampled (temperature 0.7, 300 tokens), both lanes IDENTICAL to solo, on the binary with
 the review fixes and on the one before them. With one-token windows that commit themselves
 (`STRATA_ONE_TOKEN_COMMIT=1`, `--spec-min-p 1.5`, 300 tokens per lane) the lanes before the fixes diverged from solo
-after 6 and 45 tokens; with the fixes they were IDENTICAL, pipelined and serial. CUDA, SYCL and Windows were not built
-or run. With prompt borrowing on, a lane's windows during another request's read compute the lent experts on the CPU, as
-batch slots do, so its text can differ from the solo text (in our 20K-token test it stayed coherent).
+after 6 and 45 tokens; with the fixes they were IDENTICAL, pipelined and serial. These runs used the default
+`--mtp-max-t` and coupled draft sampling off (the default); one-token lane windows from `--mtp-max-t 1` (no drafts)
+were not run on the GPUs. The lanes were not run on CUDA, SYCL or Windows (see below for what was compiled). With
+prompt borrowing on, a lane's windows during another request's read compute the lent experts on the CPU, as batch
+slots do, so its text can differ from the solo text (in our 20K-token test it stayed coherent).
+
+**Without `--lanes`, v0.1.43's behavior.** Every new engine branch runs only with lanes (it is gated on `lanes`, on
+`batch_mtp || lanes`, or on state only the lanes set, such as a live polled draft); `MtpDrafter::draft()`'s staging
+moved unchanged into `stage_round`; the one behavioral change outside such a branch, a
+guard in `Verifier::pl_commit_async`, refuses a commit that upstream's pipelined callers never make (they set
+`set_always_publish`). This was checked token for token against a stock
+v0.1.43 build, lanes off, on the same machine and configuration as above (HIP gfx1201, 2x R9700, Linux, IQ3_S, every
+expert resident): `tools/batch_test.py --batch 2` (solo and batch slots) greedy 1000 tokens, seeded sampled
+(temperature 0.7) 300 tokens, and one-token windows that commit themselves (`STRATA_ONE_TOKEN_COMMIT=1`,
+`--spec-min-p 1.5`), 2 prompts each: all six token lists equal to stock's. Through each tree's own server (no
+`--batch`), `tools/tune_bench.py --quick` answer hashes for the solo, `--pipeline-windows 2` and one-token
+configurations: 24 of 24 greedy and 23 of 24 seeded comparisons equal. The one difference (one prompt, one seed) did
+not repeat on a second pair, and each binary produced both values for that request across runs, so it is run-to-run
+variation of that request, not a difference between the two builds. `--pipeline-windows 2` started and ran the same on
+both. The engine changes made after this check (the lanes' window cap and the coupled-draft warning) act only with
+lanes.
+
+**Other backends: compiled, not run.** The branch compiles for CUDA 13.0.2 (`sm_120`) and for SYCL (Intel oneAPI
+DPC++ 2026.1.1) on Linux with no compiler diagnostic that a stock v0.1.43 build does not also give. Neither build was
+run (no NVIDIA or Intel GPU was available), so runtime behavior there, with or without lanes, is untested. Windows was
+not built.
 
 Operational note for such exactness runs on 2x 32 GB cards: `--no-prefill-borrow` makes the later stage hold back the
 prompt and ring buffers (about 1.7 GiB). At `--kv-resident 65536` the second card then kept 11124 of 11264 experts, the

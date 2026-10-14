@@ -4492,12 +4492,20 @@ int main(int argc, char** argv) {
         lanes = false;
         o.lanes = 0;
     }
+    // the lane drafters' graphs are captured at start-up in argmax mode only, and a request's sampling never reaches them
+    // (as the --batch-mtp slot drafters; --pipeline-windows decodes such requests serially).  Said once the lanes are on
+    // for good (after the fit check above).
+    if (lanes && strata::core::coupled_draft_env())
+        std::fprintf(stderr, "strata generate: WARNING: --lanes 2: a request in a lane drafts argmax tokens: --coupled-draft / "
+                             "STRATA_SPEC_COUPLED / STRATA_SPEC_PROB apply to the solo path only\n");
     if (lanes)
         for (int k = 0; k < 2; ++k)
             lane_pre_bytes[k] = 2 * (int64_t) strata::core::session_bytes(g, o.max_context, K, k == 0 ? 0 : stages[0]->lb,
                                                                           k == 0 ? split_at[0] : stages[0]->le);
-    // the lanes' MTP windows: the solo request's (the MTP part of --spec; the lanes run no lookup windows)
-    const int lane_t = std::max(2, o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec);
+    // the lanes' MTP windows: the solo request's cap (the MTP part of --spec; the lanes run no lookup windows), one token
+    // with --mtp-max-t 1 as in the solo path; the graphs are captured up to lane_cap_t (>= 2) window sizes
+    const strata::program::batch_groups::LaneWindows lane_w = strata::program::batch_groups::lane_windows(o.spec, o.mtp_max_t);
+    const int lane_t = lane_w.cap, lane_cap_t = lane_w.capture;
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
@@ -7812,7 +7820,7 @@ int main(int argc, char** argv) {
             for (int st = 0; st < 2; ++st) f_bind[st] = free_on(lane_dev(st));
             for (int b = 0; b < 2; ++b)
                 for (int st = 0; st < 2; ++st)
-                    if (!lane_v[b][st].capture_all(err, lane_t)) {
+                    if (!lane_v[b][st].capture_all(err, lane_cap_t)) {
                         std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's graphs on CUDA%d: %s%s\n", b,
                                      lane_dev(st), err.c_str(), vram_free_note().c_str());
                         return 1;
@@ -7820,14 +7828,14 @@ int main(int argc, char** argv) {
             for (int st = 0; st < 2; ++st) f_win[st] = free_on(lane_dev(st));
             for (int b = 0; b < 2 && pre_nr; ++b)
                 for (int st = 0; st < 2; ++st)
-                    if (!lane_v[b][st].capture_doorbell(err, lane_t)) {
+                    if (!lane_v[b][st].capture_doorbell(err, lane_cap_t)) {
                         std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's doorbell graphs on CUDA%d: %s%s\n", b,
                                      lane_dev(st), err.c_str(), vram_free_note().c_str());
                         return 1;
                     }
             for (int st = 0; st < 2; ++st) f_nr[st] = free_on(lane_dev(st));
             for (int b = 0; b < 2; ++b)
-                if (!lane_mtp[(size_t) b]->prepare_draft(err, lane_t)) {
+                if (!lane_mtp[(size_t) b]->prepare_draft(err, lane_cap_t)) {
                     std::fprintf(stderr, "strata serve: lanes: NO-GO: lane %d's drafter graphs: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;

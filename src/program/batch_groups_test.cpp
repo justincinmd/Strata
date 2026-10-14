@@ -5,9 +5,11 @@
 //   3. --batch-mtp (or --adapt-async 1) turns that default into one group, and says which feature did it;
 //   4. a number or `auto` given explicitly is honoured, with or without those features;
 //   5. no layer split: the number given (1) stays;
-//   6. --lanes 2 turns the default into one group and is named before --batch-mtp / --adapt-async.
+//   6. --lanes 2 turns the default into one group and is named before --batch-mtp / --adapt-async;
+//   7. a lane's MTP window cap is the solo decode's (--mtp-max-t 1 included), its captured sizes at least 2.
 #include "strata/program/batch_groups.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace bg = strata::program::batch_groups;
@@ -75,6 +77,27 @@ int main() {
               "--lanes 2, nothing given: one group, because of --lanes");
         i.adapt_async = true;
         check(bg::resolve(i).serial == bg::Serial::Lanes, "--lanes 2 with --adapt-async 1: --lanes is named");
+    }
+    {   // --lanes 2: the window cap is the solo serve loop's S_mtp (generate.cpp), --mtp-max-t 1 is honoured
+        auto solo = [](int spec, int mtp_max_t) { return mtp_max_t > 0 ? std::min(mtp_max_t, spec) : spec; };
+        bool same = true;
+        for (int spec = 2; spec <= 8; ++spec)
+            for (int m = 0; m <= 10; ++m) same = same && bg::lane_windows(spec, m).cap == solo(spec, m);
+        check(same, "lanes: cap == the solo S_mtp for --spec 2..8, --mtp-max-t 0..10");
+        auto w = bg::lane_windows(4, 0);
+        check(w.cap == 4 && w.capture == 4, "lanes: --spec 4, no --mtp-max-t: 4-token windows, 4 captured");
+        w = bg::lane_windows(4, 1);
+        check(w.cap == 1 && w.capture == 2, "lanes: --spec 4 --mtp-max-t 1: one-token windows, 2 captured");
+        w = bg::lane_windows(4, 2);
+        check(w.cap == 2 && w.capture == 2, "lanes: --spec 4 --mtp-max-t 2: 2-token windows");
+        w = bg::lane_windows(4, 3);
+        check(w.cap == 3 && w.capture == 3, "lanes: --mtp-max-t below --spec: its value");
+        w = bg::lane_windows(4, 4);
+        check(w.cap == 4 && w.capture == 4, "lanes: --mtp-max-t equal to --spec: --spec");
+        w = bg::lane_windows(4, 6);
+        check(w.cap == 4 && w.capture == 4, "lanes: --mtp-max-t above --spec: --spec");
+        w = bg::lane_windows(2, 1);
+        check(w.cap == 1 && w.capture == 2, "lanes: --spec 2 --mtp-max-t 1: one-token windows, 2 captured");
     }
     {   // nothing to give way: the slots do not divide, so auto is one group anyway and there is nothing to say
         bg::Input i = in(3, 1);
