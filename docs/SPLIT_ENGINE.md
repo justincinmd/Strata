@@ -80,6 +80,48 @@ failure, or with `FNX_PEER=0`, it uses the host-memory exchange for the whole ru
 `tests/split/test_split_engine.py`. `FNX_PF_RCCL=1` (off by default, needs the peer push) sums the prompt chunks through RCCL, which is loaded with `dlopen` and never linked: without
 `librccl.so.1`, or if its self-test fails, the engine says so in one line and keeps the host exchange (`tools/rccl_policy_test.cpp`). The numbers and open items for this path are an internal measurement; the run logs are not published.
 
+## Faster paths on four R9700 (two build options, both off by default)
+
+Two CMake options add faster paths for gfx1201. A build without them answers as v0.2.15 does: on four R9700 the first-token logits of 28 prompts
+(32 to 38,809 tokens) are the same bytes, and so are the greedy texts and the seeded sampled texts.
+
+- **`-DSTRATA_SPLIT_FAST=ON`** (`FAST=1 packaging/build_split_hip.sh`; `STRATA_SPLIT_HIP_ARCHS=gfx1201` only): the paths that keep the output to the last bit.
+  The weights are loaded non-temporal and the next layer's fixed weights are staged into the cache on a side stream; the router's table is bf16; a thread a card
+  queues the prompt path's launches, its expert products are written straight from the accumulators, and a layer's dense matrices stay as f16 between its chunks;
+  the hc read's and the window sum's grids are sized for an R9700; a draft call's copies are packed and its wait is on its last event; the many-user windows take the
+  one-user window's builder; a checkpoint's host memory is reused; a wait that reaches its time-out begins again while the driver holds the process's queues off the
+  card; and the engine holds the HIP runtime to the card's hardware compute queue slots (it sets `GPU_MAX_HW_QUEUES` when the variable is not set: with more queues
+  than slots the prompt reads lose 14 % after the first decode).
+- **`-DSTRATA_SPLIT_APPROX=ON`** (`APPROX=1`; needs FAST; `STRATA_SPLIT_CARDS=4` only): the paths that change the output's last bits, as the copy-engine ring does
+  against the GPU-thread ring. The attention is split by heads (a card attends every position for its own query heads); the decode attention runs as f16 matrix products
+  over the K/V cache's int8 codes, and the hc read on the int8 matrix instruction; the values that go between the cards in the prompt path are f16, and a chunk's hc read is split over the cards; a text segment
+  of 32 rows and fewer goes through decode windows; the draft chain's length follows the draft head's probability of each draft (a sampled request: the top
+  probability of the draft's distribution), so a seeded sampled answer is another one.
+
+Measured on four R9700 (32 GB, 210 W cap each, PCIe 5.0 x16 a card), UD-Q4_K_XL, 8 slots, `FNX_PEER=1 FNX_PEER_PARTS=0` for every column, one engine start a
+column in one run (an internal measurement; the run logs are not published):
+
+| | v0.2.15 | no option | FAST | FAST + APPROX |
+| --- | --- | --- | --- | --- |
+| one request, greedy / sampled, tokens per second | 226 / 206 | 231 / 211 | 278 / 269 | 357 / 357 |
+| 4K / 16K / 64K prompt, tokens read per second | 2765 / 3083 / 3116 | 2780 / 3134 / 3165 | 3305 / 3420 / 3398 | 6285 / 7033 / 7190 |
+| 109K prompt with a 12-character answer (median of 3) | 36.2 s | 35.7 s | 33.4 s | 15.7 s |
+| 1, 2, 4, 8 requests at once (combined tokens per second) | 129, 194, 217, 271 | 132, 191, 213, 272 | 182, 250, 287, 348 | 232, 296, 331, 417 |
+| a replay of 98 agent turns at a 262K context: wall time / median first token | 145 s / 491 ms | not run | 124 s / 413 ms | 76 s / 240 ms |
+| the same answers as v0.2.15 (28 greedy answers of 200 tokens) | - | 28 of 28 | 28 of 28 | 9 of 28 |
+
+How the output was compared (one request at a time, against the v0.2.15 binary in the same run): the first-token logits of the 28 prompts byte for byte
+(`FNX_DUMP_FIRST_LOGITS`), 8 greedy answers of 400 tokens, 8 sampled answers of 300 tokens with fixed seeds (temperature 0.7), and the 28 greedy answers of the
+table. The FAST build is equal on all of them, and on 84 of 84 logit files over three passes of one start. With 8 slots (where v0.2.15 writes no logits) the FAST build
+against the build without options: 56 of 56 first-token files and 50 of 50 forced tails of 64 decode steps each (`FNX_TF_TAIL=64`), byte for byte. v0.2.15 itself gave another logit vector for one
+242-token prompt in the first pass after a start (the same top token), so a comparison must take its later passes as the reference. The APPROX build differs in
+every logit file; its 28 answers share 51 % of their text with v0.2.15's before the first other token.
+
+Every run-time path keeps its own variable as an override for a measurement (`FNX_X=0` turns one off; `src/split/src/env.hpp` names the rule, and each variable is
+described where it is read); the attention's split by heads and the weights' load form are fixed when the kernels are compiled. Not proven: FAST with two and three cards compiles and has not been run; APPROX exists for four cards only; no card other than the R9700 has run
+either option. During a driver eviction (KFD stops the process's queues, for example when the desktop's card is busy) a cache prefetcher can time out; the engine
+prints one line a card and goes on.
+
 ## DFlash2 instead of the MTP draft layer (engine flag; the launcher starts it only when you choose both)
 
 `strata-split-N --draft dflash2 --draft-model PACK --draft-vocab FILE` (or `FNX_DRAFT=dflash2`) drafts with the DFlash2 block drafter instead of the MTP draft layer: one drafter a lane on the first card (about 0.7 GB for the pack and the draft head, about 75 MiB a lane), the taps of layers 5, 15, 25, 35 and 45 made inside the window graphs, nothing exchanged between the cards. Answers are those of the MTP split and of the split with no drafter (greedy hashes equal, 1 and 8 users). It is measured faster on greedy code and JSON (+5 to +14%) and slower on sampled text and agent turns, and at 4 users, so Auto keeps the MTP draft layer and nothing starts it by itself. The launcher and the app start it only for a person who chose DFlash2 by name (`--drafting dflash2`) and the split engine on (`--split-engine on`): the run config then carries `--draft dflash2 --draft-model PACK` instead of `--mtp`, the MTP layer is not loaded or needed, and `--parallel N` sets the lanes as before. With the split engine on Auto, DFlash2 chosen by name keeps the normal layer split with DFlash2. The numbers are an internal measurement; the run logs are not published. Testers' switches: `FNX_DF2_CONF` (0.35), `FNX_DF2_DEFER`, `FNX_DF2_REFRESH`, `FNX_DF2_CALL_MS`, `FNX_DF2_TRACE`, `FNX_SPECULATE=0` (one row a window, no drafts).
