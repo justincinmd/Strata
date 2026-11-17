@@ -175,9 +175,19 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
             }
         return best;
     };
+    // FNX_PF_TIMING: a line a read with its phases (ms): the plan (where to start from), the lane's change (park, restore, reset), each segment's
+    // prefill and each checkpoint between them
+    static const bool timing = env_int("FNX_PF_TIMING", 0) != 0;
+    std::string t_segs;
+    auto ms1 = [](double v) {
+        char b[32];
+        std::snprintf(b, sizeof b, "%.1f", v);
+        return std::string(b);
+    };
     const std::vector<int> hist = e_.history();
     int ck_live = -1;
     const size_t from_live = usable(hist, live_.ckpts, ck_live);
+    const double t_match = ms_since(t0);
     int best_parked = -1, ck_parked = -1;
     size_t from_parked = 0;
     for (size_t i = 0; i < cache_->parked.size(); ++i) {
@@ -218,6 +228,7 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
             live_ = Conv{};
         }
     }
+    const double t_plan = ms_since(t0);
     // checkpoints past where the engine now is belong to the text it left
     e_.set_images(hints.images);
     const size_t at = (size_t) e_.pos();
@@ -257,13 +268,23 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
             e_.on_prefill_chunk = [&, pos](int done) {
                 if (progress) progress((int) pos + done, n);
             };
+            const auto t_seg = std::chrono::steady_clock::now();
+            // FNX_READ_WIN=n (32 in an APPROX build; 0: off): a segment of n rows and fewer goes through decode windows. A prompt pass costs ~50 ms
+            // whatever its rows (its ~4500 launches a card and the cards' sums), a window of T rows ~6 + T ms; every request's last segment (the 4-6
+            // tokens after its last message boundary) is such a pass. The choice follows the segment's length alone, so a prompt read the same way
+            // gives the same rows; the rows differ from the prompt path's in the last bits
+            static const long long win_rows = std::max<long long>(0, env_int("FNX_READ_WIN", APPROX ? 32 : 0));
             try {   // progress may end the read at a chunk boundary (by throwing): the engine holds what was read
-                e_.prefill(seg, prompt[end]);
+                bool text = true;   // (an image's cells are the prompt path's to fill)
+                for (const Engine::Image& im : hints.images) text = text && (size_t) (im.cell + im.n) <= pos;
+                if (text && (long long) seg.size() <= win_rows) read_windows_(seg, prompt[end]);
+                else e_.prefill(seg, prompt[end]);
             } catch (...) {
                 e_.on_prefill_chunk = nullptr;
                 throw;
             }
             e_.on_prefill_chunk = nullptr;
+            if (timing) t_segs += " " + std::to_string(end - pos) + " rows " + ms1(ms_since(t_seg));
             pos = end;
         }
         if (end == body) break;
@@ -283,12 +304,43 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
                              root, cache_->parked.back().ckpts.size(), ms_since(t_root));
             }
         }
+        const auto t_ck = std::chrono::steady_clock::now();
         checkpoint(live_);
+        if (timing)
+            t_segs += " | checkpoint " + std::to_string(live_.ckpts.back()->total() >> 10) + " KiB " + ms1(ms_since(t_ck)) + " |";
     }
     live_.len = body;
+    const auto t_ev = std::chrono::steady_clock::now();
     evict(0);
     prompt_ = prompt;
     st.prompt_ms = ms_since(t0);
+    if (timing)
+        std::fprintf(stderr, "session read: %d tokens = %zu reused + %zu read in %.1f ms: match %.1f, lane change %.1f, segments%s, evict %.1f\n", n, at, body - at,
+                     st.prompt_ms, t_match, t_plan - t_match, t_segs.c_str(), ms_since(t_ev));
+}
+
+// seg through windows of MAXT rows and fewer on the current lane; next: the token after it. After each window the draft layer (or the drafter) takes
+// the kept rows, as after a round of generate(): its cells for them stay current
+void Session::read_windows_(const std::vector<int>& seg, int next) {
+    for (size_t a = 0; a < seg.size(); a += (size_t) MAXT) {
+        const size_t T = std::min((size_t) MAXT, seg.size() - a);
+        const std::vector<int> rows(seg.begin() + (long) a, seg.begin() + (long) (a + T));
+        const int p = e_.pos();
+        e_.verify(rows);
+        e_.commit((int) T);
+        std::vector<int> toks(rows.begin() + 1, rows.end());   // the token after each row
+        toks.push_back(a + T < seg.size() ? seg[a + T] : next);
+        if (e_.df2_on()) {
+            Engine::Df2Req q;
+            q.lane = lane_, q.row0 = 0, q.used = (int) T, q.pos0 = p, q.anchor = toks.back();
+            e_.df2_defer(q);
+        } else if (e_.mtp_on()) {
+            e_.draft((int) T, true, 0, toks, p);
+        }
+        // as after a chunk of prefill(): progress, the end of the read on a stop or a yield, the other lanes' windows. Last in the window: it may
+        // run a window of another lane
+        if (e_.on_prefill_chunk) e_.on_prefill_chunk((int) (a + T));
+    }
 }
 
 void Session::checkpoint(Conv& c) {
@@ -416,12 +468,29 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     const bool adapt = env_int("FNX_DRAFT_ADAPT", 1) != 0;
     constexpr double ROUND_MS = 11.2, DRAFT_ROW_MS = 1.3, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
     std::vector<double> tried(MAXT, 1.0), stood(MAXT, 0.7);   // a prior of 70% at every position
+    // the three costs are this rig's when given (FNX_PLAN_ROUND_MS, FNX_PLAN_ROW_MS, FNX_PLAN_CALL_MS: read them off FNX_SOLO_STATS' line
+    // "fit a + b a row, draft call c": round = a + b + c + 0.1, row = b, call = c; the constants are another make of card with another file). With
+    // FNX_PLAN_LIVE=1 (off by default) the engine's running fit is used instead once it has data: it follows the rig by itself, but a chain's length then
+    // depends on measured times, and an answer is then no longer the same from run to run: not a seeded sampled one, and not a greedy one either (a
+    // window's rows are not bit-invariant to where the windows' edges fall: 2 x R9700, IQ3_S, 6 of 8 greedy answers differed from the constants' after
+    // 100-300 tokens). The same holds for the three settings above: answers are comparable only between runs with the same costs
+    static const double plan_round = env_num("FNX_PLAN_ROUND_MS", ROUND_MS), plan_row = env_num("FNX_PLAN_ROW_MS", DRAFT_ROW_MS),
+                        plan_call = env_num("FNX_PLAN_CALL_MS", DRAFT_CALL_MS);
+    static const bool plan_live = env_int("FNX_PLAN_LIVE", 0) != 0;
+    if (!(plan_round > 0.0 && plan_round <= 1000.0 && plan_row > 0.0 && plan_row <= 1000.0 && plan_call >= 0.0 && plan_call <= 1000.0))
+        throw std::runtime_error("FNX_PLAN_ROUND_MS / FNX_PLAN_ROW_MS / FNX_PLAN_CALL_MS: want ms in (0, 1000] (the call's may be 0)");
     auto chain_len = [&](double call_ms) {
         int best = K_;
         double best_rate = -1.0, expect = 1.0, reach = 1.0;
+        double round_ms = plan_round, row_ms = plan_row, fa = 0, fb = 0;
+        if (call_ms > 0.0) call_ms = plan_call;
+        if (plan_live && call_ms > 0.0 && e_.cost_fit[0].get(fa, fb)) {
+            if (e_.draft_calls_fit > 20) call_ms = e_.draft_call_fit;
+            round_ms = fa + fb + call_ms + 0.1, row_ms = fb;
+        }
         for (int k = 1; k <= K_; ++k) {   // at least d1: its acceptance stays measured (it pays above ~8% anyway)
             reach *= stood[(size_t) k - 1] / tried[(size_t) k - 1], expect += reach;
-            const double rate = expect / (ROUND_MS + k * DRAFT_ROW_MS + std::max(0, k - 1) * call_ms);
+            const double rate = expect / (round_ms + k * row_ms + std::max(0, k - 1) * call_ms);
             if (rate > best_rate) best_rate = rate, best = k;
         }
         return best;
@@ -436,17 +505,69 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     std::vector<Dist> qs;   // per draft, the distribution it was drawn from; empty: a fixed draft (lookup, argmax)
     bool mtp_round = false;   // the drafts are an MTP chain (its acceptance feeds chain_len)
     int mtp_chains = 0;
+    // FNX_DRAFT_STATS=1 (a measuring aid, greedy requests only; off by default): what more rows could gain. Every draft call also fetches the draft
+    // head's candidates (so a call costs a little more; the drafts and the text are the same), and a line a request (totals since the start) gives,
+    // for the chain rounds: by chain position how often a draft that was reached stood, how often the true token at the first rejection was the
+    // draft head's 2nd or 3rd choice, and acceptance by the head's own probability of its draft (softmax over its candidates, ten bins)
+    static const bool dstats = env_int("FNX_DRAFT_STATS", 0) != 0;
+    struct Alt { int a2 = -1, a3 = -1; float p1 = -1.f; };
+    struct DStat { long tried[MAXT] = {}, stood[MAXT] = {}, rej[MAXT] = {}, hit2[MAXT] = {}, hit3[MAXT] = {}, btried[10] = {}, bstood[10] = {}, rounds = 0; };
+    static DStat G;
+    std::vector<Alt> alts;   // with dstats: a draft's alternatives, parallel to drafts (empty: not a round to count)
+    Alt last_alt;
+    // FNX_DRAFT_CONF=1 (an APPROX build's default; 0: the positions' averages, chain_len): the MTP chain's length follows the draft head's own probability of each draft, not the positions' averages.
+    // 4 x R9700, Q4, FNX_DRAFT_STATS, 1539 chain rounds: a draft with a probability of 0.9 and more (67 % of them) stood in 94 %, 0.8: 70 %, 0.6-0.8:
+    // 50-57 %, under 0.6: 9-37 %, while by position 76-83 % stood everywhere. The rule, draft by draft, with E the round's expected tokens, T its ms
+    // (FNX_DRAFT_CONF_ROUND_MS 6.2 for a window of one row and d1's call, FNX_DRAFT_CONF_ROW_MS 0.97 a verify row, FNX_DRAFT_CONF_CALL_MS 0.6 a call
+    // after d1: this rig's FNX_SOLO_STATS fit) and a the chance that the draft stands (how often drafts of its probability bin stood in this request,
+    // started from the measured table): the draft gets its row if that raises E / T, and the chain goes on to one more call if a draft of the mean
+    // chance would. Every draft call then fetches the head's candidates (as a sampled request's); a sampled request uses the top probability of the
+    // draft's distribution in place of the drawn token's (see draft_one). The constants are fixed, so an answer is the same
+    // from run to run; it is another answer than without the switch (the windows' edges move)
+    static const bool dconf = env_int("FNX_DRAFT_CONF", APPROX) != 0;
+    static const double conf_round = dconf ? env_num("FNX_DRAFT_CONF_ROUND_MS", 6.2) : 6.2, conf_row = dconf ? env_num("FNX_DRAFT_CONF_ROW_MS", 0.97) : 0.97,
+                        conf_call = dconf ? env_num("FNX_DRAFT_CONF_CALL_MS", 0.6) : 0.6;
+    if (dconf && !(conf_round > 0.0 && conf_row > 0.0 && conf_call >= 0.0)) throw std::runtime_error("FNX_DRAFT_CONF_*_MS: want ms above 0");
+    double ctried[10], cstood[10], ct_all = 8.0, cs_all = 8.0 * 0.78;
+    {
+        const double prior[10] = {0.09, 0.2, 0.3, 0.3, 0.35, 0.37, 0.5, 0.57, 0.7, 0.94};
+        for (int i = 0; i < 10; ++i) ctried[i] = 8.0, cstood[i] = 8.0 * prior[i];
+    }
+    std::vector<float> dps;   // with dconf: the head's probability of each draft, parallel to drafts
+    float last_p = -1.f;
     // one draft from the draft layer for the token after pen_seq (the penalty window before it)
     auto draft_one = [&](int T, bool from_main, int src_row, const std::vector<int>& toks, int pos0, const std::vector<int>& pen_seq,
                          Dist& q) {
         Engine::Penalties::Row pen;
         if (pen_drafts) pen = penalty_row(pen_seq, s);
-        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts);
+        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts || ((dstats || dconf) && !sample));
         st.draft_ms += e_.last_draft_ms, st.draft_gpu_ms += e_.last_draft_gpu_ms, ++st.draft_calls;
+        last_p = -1.f;
+        if ((dstats || dconf) && !sample) {
+            auto c = e_.last_draft_cands;   // {logit, token}
+            std::sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            last_alt = Alt{};
+            double sum = 0.0, mine = 0.0;
+            for (const auto& [v, tok] : c) {
+                const double w = std::exp((double) v - (double) c[0].first);
+                sum += w;
+                if (tok == d) {
+                    mine = w;
+                    continue;
+                }
+                if (last_alt.a2 < 0) last_alt.a2 = tok;
+                else if (last_alt.a3 < 0) last_alt.a3 = tok;
+            }
+            if (sum > 0.0) last_p = (float) (mine / sum);   // (0 when the draft is not among the candidates)
+            if (!c.empty() && c[0].second == d) last_alt.p1 = last_p;
+        }
         q = Dist{};
         if (samp_drafts) {
             q = make_dist(e_.last_draft_cands, s);
             d = draw(q, unif(rng));
+            // sampled: the distribution's top probability, not the drawn token's. A row decided by the token that was drawn would bias the
+            // output (the rejection sampler is exact only when the choice to verify a draft does not depend on that draft)
+            if (dconf) last_p = q.p.empty() ? -1.f : (float) *std::max_element(q.p.begin(), q.p.end());
         }
         return d;
     };
@@ -463,7 +584,10 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         // drafts that would run past the context are cut; a window must fit at least its first row
         const int room = e_.max_ctx() - e_.pos() - 1;
         if (room < 0) break;
-        if ((int) drafts.size() > room) drafts.resize(room), qs.resize(room);
+        if ((int) drafts.size() > room) {
+            drafts.resize(room), qs.resize(room);
+            if (dps.size() > (size_t) room) dps.resize(room);
+        }
         std::vector<int> rows{x};
         rows.insert(rows.end(), drafts.begin(), drafts.end());
         const int p = e_.pos();
@@ -524,6 +648,26 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 o[n] = draw(d, unif(rng));
                 ++n;
                 break;
+            }
+        }
+        if (dstats && !sample && mtp_round && alts.size() == drafts.size()) {
+            const int acc = n - 1, nd = (int) drafts.size();
+            ++G.rounds;
+            for (int j = 0; j < nd && j <= acc && j < MAXT; ++j) {
+                ++G.tried[j], G.stood[j] += j < acc;
+                if (alts[(size_t) j].p1 >= 0.f) {
+                    const int bin = std::min(9, (int) (alts[(size_t) j].p1 * 10.f));
+                    ++G.btried[bin], G.bstood[bin] += j < acc;
+                }
+            }
+            if (acc < nd && acc < MAXT) ++G.rej[acc], G.hit2[acc] += alts[(size_t) acc].a2 == o[acc], G.hit3[acc] += alts[(size_t) acc].a3 == o[acc];
+        }
+        if (dconf && mtp_round && dps.size() == drafts.size()) {   // how often a draft of its probability bin stood
+            const int acc = n - 1;
+            for (int j = 0; j < (int) drafts.size() && j <= acc; ++j) {
+                const int bin = std::min(9, std::max(0, (int) (dps[(size_t) j] * 10.f)));
+                ctried[bin] += 1.0, cstood[bin] += j < acc ? 1.0 : 0.0;
+                ct_all += 1.0, cs_all += j < acc ? 1.0 : 0.0;
             }
         }
         if (mtp_round) {   // chain position j was reached if every draft before it stood
@@ -594,6 +738,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         }
         Dist q1;
         const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, pen_seq, q1);
+        alts.clear(), dps.clear();
         if (!speculate) {
             drafts.clear(), qs.clear();
             continue;
@@ -608,15 +753,63 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         // the MTP chain: each draft from the draft layer's own row for the one before
         // every 4th chain one draft longer, so the position past the chosen length stays measured (the full K every 4th
         // chain cost prose ~0.9 ms a round)
+        if (dconf && last_p >= 0.f) {   // by the head's probability (the note at dconf)
+            mtp_round = true;
+            auto chance = [&](float pr) {
+                const int bin = std::min(9, std::max(0, (int) (pr * 10.f)));
+                return cstood[bin] / ctried[bin];
+            };
+            double E = 1.0, T = conf_round, reach = 1.0;
+            drafts.clear(), qs.clear();
+            int dj = d1;
+            Dist qj = std::move(q1);
+            float pj = last_p;
+            Alt aj = last_alt;
+            for (int j = 0;; ++j) {
+                const double a = chance(pj);
+                // this draft's row would not pay: the chain ends before it. Not the first draft: it always has its row, as on the lookup path
+                // (a lookup chain needs d1 itself, so a d1 that could lose its row only here would make its row depend on the token drawn)
+                if (j > 0 && (E + reach * a) / (T + conf_row) <= E / T) break;
+                drafts.push_back(dj), qs.push_back(std::move(qj)), dps.push_back(pj);
+                if (dstats) alts.push_back(aj);
+                reach *= a, E += reach, T += conf_row;
+                if (j + 1 >= K_ || pj < 0.f) break;
+                if ((E + reach * (cs_all / ct_all)) / (T + conf_row + conf_call) <= E / T) break;   // one more call and row would not pay
+                if (pen_drafts) pen_seq.push_back(drafts.back());
+                qj = Dist{};
+                dj = draft_one(1, false, j == 0 ? used - 1 : 0, {drafts.back()}, p + used + j, pen_seq, qj);
+                T += conf_call, pj = last_p, aj = last_alt;
+            }
+            mtp_round = true;
+            continue;
+        }
         const int k = !adapt ? K_ : std::min(K_, chain_len(DRAFT_CALL_MS) + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
         mtp_round = true;
         drafts = {d1}, qs = {std::move(q1)};
+        if (dstats) alts = {last_alt};
         for (int j = 1; j < k; ++j) {
             if (pen_drafts) pen_seq.push_back(drafts.back());
             Dist q;
             drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q));
             qs.push_back(std::move(q));
+            if (dstats) alts.push_back(last_alt);
         }
+    }
+    if (dstats && !sample && G.rounds) {
+        std::string l = "sfnx: draft stats (" + std::to_string(G.rounds) + " chain rounds): position: reached, stood %, at its rejection 2nd / 3rd choice true %:";
+        char b[96];
+        for (int j = 0; j < MAXT && G.tried[j]; ++j) {
+            std::snprintf(b, sizeof b, " %d: %ld, %.1f, %.1f / %.1f;", j + 1, G.tried[j], 100.0 * G.stood[j] / G.tried[j],
+                          G.rej[j] ? 100.0 * G.hit2[j] / G.rej[j] : 0.0, G.rej[j] ? 100.0 * G.hit3[j] / G.rej[j] : 0.0);
+            l += b;
+        }
+        l += " | by the head's probability of its draft (bin: drafts, stood %):";
+        for (int i = 0; i < 10; ++i)
+            if (G.btried[i]) {
+                std::snprintf(b, sizeof b, " %.1f: %ld, %.1f;", i / 10.0, G.btried[i], 100.0 * G.bstood[i] / G.btried[i]);
+                l += b;
+            }
+        std::fprintf(stderr, "%s\n", l.c_str());
     }
     prompt_.clear();
     timing_ = nullptr;

@@ -16,6 +16,35 @@
 set(STRATA_SPLIT_CARDS "2" CACHE STRING "card counts strata-split is built for (2, 3, 4)")
 set(STRATA_SPLIT_ARCH "" CACHE STRING "compute capability strata-split is built for (e.g. 86)")
 set(STRATA_SPLIT_PF_JOB "64" CACHE STRING "rows of one expert per prompt-path job: 64 (default) or 128")
+# The engine's two opt-in sets of faster paths (HIP, gfx12; docs/SPLIT_ENGINE.md "Faster paths on four R9700"). Both off (the default): the engine's
+# kernels and paths are the ones built without them.
+#   STRATA_SPLIT_FAST    the paths that give the default build's output to the last bit. At build time: the weights' loads non-temporal and the next
+#                        layer's fixed weights staged into the cache on a side stream (FNX_MALL_NT=2, FNX_MALL_PF: src/nt_load.cuh, src/kernels.hpp
+#                        PfSet), the router's table as bf16 (FNX_ROUTER_BF16: src/model.hpp). At run time: every path whose default is
+#                        src/env.hpp's FAST
+#   STRATA_SPLIT_APPROX  the paths that change the output's last bits (needs STRATA_SPLIT_FAST; 4 cards). At build time: the attention split by heads and
+#                        the decode attention as matrix products (FNX_ATT_HEADS, FNX_ATT_MM: src/model.hpp, src/attn_mm.cuh), the hc read as a
+#                        ticket queue on the int8 matrix instruction (FNX_MM, FNX_MM_HC: src/hc_mm.cuh; another sum order than k_hc's). At run
+#                        time: every path whose default is src/env.hpp's APPROX
+option(STRATA_SPLIT_FAST "strata-split: the faster paths with the same output bits (HIP, gfx12)" OFF)
+option(STRATA_SPLIT_APPROX "strata-split: the faster paths that change the output's last bits (needs STRATA_SPLIT_FAST; 4 cards)" OFF)
+if(STRATA_SPLIT_APPROX AND NOT STRATA_SPLIT_FAST)
+  message(FATAL_ERROR "STRATA_SPLIT_APPROX needs STRATA_SPLIT_FAST=ON")
+endif()
+if(STRATA_SPLIT_FAST)
+  if(NOT STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA)
+    message(FATAL_ERROR "STRATA_SPLIT_FAST is a HIP option (gfx12)")
+  endif()
+  add_compile_definitions(FNX_FAST=1 FNX_MALL_NT=2 FNX_MALL_PF=1 FNX_ROUTER_BF16=1)
+endif()
+if(STRATA_SPLIT_APPROX)
+  foreach(_n ${STRATA_SPLIT_CARDS})   # (by heads a card's query heads share one KV head, and src/attn_mm.cuh's kernel holds 6 query heads a card)
+    if(NOT _n STREQUAL "4")
+      message(FATAL_ERROR "STRATA_SPLIT_APPROX builds for 4 cards only (got ${STRATA_SPLIT_CARDS}): set STRATA_SPLIT_CARDS=4")
+    endif()
+  endforeach()
+  add_compile_definitions(FNX_APPROX=1 FNX_ATT_HEADS=1 FNX_ATT_MM=1 FNX_MM=1 FNX_MM_HC=1)
+endif()
 
 set(_fnx_hip OFF)
 if(STRATA_ENABLE_HIP AND NOT STRATA_ENABLE_CUDA AND NOT WIN32 AND NOT APPLE)
@@ -44,6 +73,13 @@ if(_fnx_hip)
     set(_fnx_hip_archs ${STRATA_SPLIT_HIP_ARCHS})
   else()
     set(_fnx_hip_archs ${STRATA_HIP_ARCH_LIST})
+  endif()
+  if(STRATA_SPLIT_FAST)   # (its rules were measured on gfx1201; APPROX's kernels use the gfx12 int8 matrix instruction)
+    foreach(_a ${_fnx_hip_archs})
+      if(NOT _a STREQUAL "gfx1201")
+        message(FATAL_ERROR "STRATA_SPLIT_FAST builds for gfx1201 only (got ${_fnx_hip_archs}): set STRATA_SPLIT_HIP_ARCHS=gfx1201")
+      endif()
+    endforeach()
   endif()
   set(_fnx_hip_ok gfx1100 gfx1101 gfx1102 gfx1103 gfx11-generic gfx1200 gfx1201)
   set(_fnx_hip_bad "")
@@ -160,10 +196,60 @@ if(_fnx_hip)
   set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
 endif()
 
+# kbench: the decode window's kernels alone on one card with random weights (tools/kbench.cu). HIP only, built by name
+if(_fnx_hip)
+  foreach(_n ${STRATA_SPLIT_CARDS})
+    set(_t strata-split-kbench-${_n})
+    add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/kbench.cu ${_sp_kparts})
+    set_source_files_properties(${_sp}/tools/kbench.cu PROPERTIES LANGUAGE HIP)
+    target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
+    target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1 FNX_KBENCH=1
+                               FNX_DIR="${_sp}")
+    target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
+    target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
+    set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+  endforeach()
+endif()
+
+# gdn mm test: k_gdn_ch_rec_mm against k_gdn_ch_rec and the row-by-row recurrence, one card (tools/gdn_mm_test.cu). HIP only, by name;
+# the kernel is in an APPROX build only
+if(_fnx_hip AND STRATA_SPLIT_APPROX)
+  set(_t strata-split-gdnmm-test-4)
+  add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/gdn_mm_test.cu)
+  set_source_files_properties(${_sp}/tools/gdn_mm_test.cu PROPERTIES LANGUAGE HIP)
+  target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
+  target_compile_definitions(${_t} PRIVATE FNX_NCARD=4 FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1
+                             FNX_DIR="${_sp}")
+  target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
+  target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
+  set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+endif()
+if(_fnx_hip)
+  # tools/moe_mma_test.cu: the prompt MoE kernels alone on random weights of the real shapes (timing + output hashes)
+  set(_t strata-split-moemm-test-4)
+  add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/moe_mma_test.cu)
+  set_source_files_properties(${_sp}/tools/moe_mma_test.cu PROPERTIES LANGUAGE HIP)
+  target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
+  target_compile_definitions(${_t} PRIVATE FNX_NCARD=4 FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1
+                             FNX_PF_JOB=${STRATA_SPLIT_PF_JOB} FNX_DIR="${_sp}")
+  target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
+  target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
+  set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+  # the same with 128-row jobs (FNX_PF_JOB=128)
+  set(_t strata-split-moemm-test-4-j128)
+  add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/moe_mma_test.cu)
+  target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
+  target_compile_definitions(${_t} PRIVATE FNX_NCARD=4 FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1
+                             FNX_PF_JOB=128 FNX_DIR="${_sp}")
+  target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
+  target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
+  set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+endif()
+
 # the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser): plain C++, no GPU
 if(STRATA_BUILD_TESTS)
   list(GET STRATA_SPLIT_CARDS 0 _n0)
-  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test)
+  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test queue_budget_test)
     add_executable(split_${_tt} ${_sp}/tools/${_tt}.cpp)
     target_include_directories(split_${_tt} PRIVATE ${_sp}/src ${_sp}/tools)
     target_compile_definitions(split_${_tt} PRIVATE FNX_NCARD=${_n0} FNX_27B=0)

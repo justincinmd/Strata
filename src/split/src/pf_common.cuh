@@ -15,6 +15,7 @@
 #include <string>
 
 #include "kernels.hpp"
+#include "diag.cuh"   // the time-out branches' record
 #include "owned.hpp"
 #include "pf_ring_plan.hpp"
 
@@ -179,10 +180,16 @@ static __global__ void k_pfa_push(const float4* __restrict__ x, int n4, float4* 
 static __global__ void k_pfa_sum(float* __restrict__ x, int C, const float4* __restrict__ box, const unsigned* __restrict__ flag, int g, unsigned seq, size_t set_off4,
                                  size_t slot4, unsigned* err) {
     if (threadIdx.x < NCARD && (int) threadIdx.x != g) {
-        const long long t0 = clock64();
+        const long long ts = clock64();
+        long long t0 = ts;
         while ((int) (*(volatile const unsigned*) (flag + threadIdx.x) - seq) < 0) {
             __builtin_amdgcn_s_sleep(1);
-            if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+            if (const long long dt = clock64() - t0; __builtin_expect(dt > RING_TIMEOUT_CYCLES, 0)) {
+                if (diag_wait_on(err, dt, RING_TIMEOUT_CYCLES, ts, t0)) continue;   // the driver had the queues off the cards
+                diag_timeout(err, DK_PROMPT_SUM, seq, *(volatile const unsigned*) (flag + threadIdx.x), 0u, threadIdx.x, (unsigned) blockIdx.x, dt);
+                atomicOr(err, 1u);
+                break;
+            }
         }
     }
     __syncthreads();

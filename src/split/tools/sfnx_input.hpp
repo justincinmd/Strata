@@ -4,13 +4,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <iostream>
 #include <mutex>
+#include <poll.h>
 #include <string>
+#include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace sfnx {
 
@@ -27,6 +32,11 @@ struct Input {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<std::pair<std::string, long>> lines;
+    // FNX_REQ_TIMING (`stamp`, set before the reader starts): each queued line's arrival (steady clock, ns; else 0); next() leaves the taken
+    // line's in `taken_ns` (the engine's thread only)
+    bool stamp = false;
+    std::deque<long long> stamps;
+    long long taken_ns = 0;
     bool eof = false;
     long seq = 0;       // request lines queued (under mu)
     long running = 0;   // the request the engine is on (begin / end; under mu), 0: none
@@ -42,48 +52,89 @@ struct Input {
             yield_upto[i] = 0;
         }
     }
-    void run(std::istream& is = std::cin) {
-        std::string line;
-        while (std::getline(is, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line == "STOP") {
-                std::lock_guard<std::mutex> lk(mu);
-                stop_upto = seq;
-                if (running > 0 && running == seq) stop_now = true;
-                continue;
-            }
-            int slot = -1;
-            if (std::sscanf(line.c_str(), "BSTOP %d", &slot) == 1) {
-                if (slot >= 0 && slot < MAX_SLOTS) bstop_upto[slot] = slot_seq[slot];
-                else std::fprintf(stderr, "sfnx: '%s': no slot %d (0..%d): nothing stopped\n", line.c_str(), slot, MAX_SLOTS - 1);
-                continue;
-            }
-            if (std::sscanf(line.c_str(), "BYIELD %d", &slot) == 1) {
-                if (slot >= 0 && slot < MAX_SLOTS) {
-                    yield_upto[slot] = slot_seq[slot];
-                    solo_yield_slot = slot;   // before the number: whoever sees the number sees this slot or a later one
-                    solo_yield_upto = solo_seq;
-                } else {
-                    std::fprintf(stderr, "sfnx: '%s': no slot %d (0..%d): nothing yields\n", line.c_str(), slot, MAX_SLOTS - 1);
-                }
-                continue;
-            }
-            const std::string cmd = line.substr(0, line.find(' '));
-            const bool request = cmd == "GEN" || cmd == "GENI" || cmd == "BGEN" || cmd == "BGENI";
+    // one line of the input, without its newline (the line is taken: its text moves to the queue)
+    void take(std::string& line) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "STOP") {
             std::lock_guard<std::mutex> lk(mu);
-            long n = 0;
-            if (request) {
-                n = ++seq;
-                if (cmd == "GEN" || cmd == "GENI") solo_seq = n;
-                else if (std::sscanf(line.c_str() + cmd.size(), " %d", &slot) == 1 && slot >= 0 && slot < MAX_SLOTS)
-                    slot_seq[slot] = n;
-            }
-            lines.emplace_back(line, n);
-            cv.notify_one();
+            stop_upto = seq;
+            if (running > 0 && running == seq) stop_now = true;
+            return;
         }
+        int slot = -1;
+        // (a request line is its prompt's ids as text, 650 KB at 100K tokens, and sscanf measures its whole string first: only a line that starts as one of these)
+        if (line.compare(0, 5, "BSTOP") == 0 && std::sscanf(line.c_str(), "BSTOP %d", &slot) == 1) {
+            if (slot >= 0 && slot < MAX_SLOTS) bstop_upto[slot] = slot_seq[slot];
+            else std::fprintf(stderr, "sfnx: '%s': no slot %d (0..%d): nothing stopped\n", line.c_str(), slot, MAX_SLOTS - 1);
+            return;
+        }
+        if (line.compare(0, 6, "BYIELD") == 0 && std::sscanf(line.c_str(), "BYIELD %d", &slot) == 1) {
+            if (slot >= 0 && slot < MAX_SLOTS) {
+                yield_upto[slot] = slot_seq[slot];
+                solo_yield_slot = slot;   // before the number: whoever sees the number sees this slot or a later one
+                solo_yield_upto = solo_seq;
+            } else {
+                std::fprintf(stderr, "sfnx: '%s': no slot %d (0..%d): nothing yields\n", line.c_str(), slot, MAX_SLOTS - 1);
+            }
+            return;
+        }
+        const std::string cmd = line.substr(0, line.find(' '));
+        const bool request = cmd == "GEN" || cmd == "GENI" || cmd == "BGEN" || cmd == "BGENI";
+        std::lock_guard<std::mutex> lk(mu);
+        long n = 0;
+        if (request) {
+            n = ++seq;
+            if (cmd == "GEN" || cmd == "GENI") solo_seq = n;
+            else if (std::sscanf(line.c_str() + cmd.size(), " %d", &slot) == 1 && slot >= 0 && slot < MAX_SLOTS)
+                slot_seq[slot] = n;
+        }
+        lines.emplace_back(std::move(line), n);
+        stamps.push_back(stamp ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0);
+        cv.notify_one();
+    }
+    void finish() {
         std::lock_guard<std::mutex> lk(mu);
         eof = true;
         cv.notify_one();
+    }
+    void run(std::istream& is = std::cin) {
+        std::string line;
+        while (std::getline(is, line)) {
+            take(line);
+            line.clear();
+        }
+        finish();
+    }
+    // the same lines from a file descriptor, in 64 KiB reads. std::getline on std::cin (synchronized with stdio) takes a call a
+    // character: 6.9 ms for the line of a 104K-token prompt (665 KB), against 0.9 ms here. A last line without its newline counts, as with getline
+    void run_fd(int fd) {
+        std::string line;
+        std::vector<char> buf((size_t) 1 << 16);
+        for (;;) {
+            const ssize_t got = ::read(fd, buf.data(), buf.size());
+            if (got < 0 && errno == EINTR) continue;
+            if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {   // a descriptor someone made non-blocking: wait for its next bytes
+                struct pollfd pf = {fd, POLLIN, 0};
+                ::poll(&pf, 1, -1);
+                continue;
+            }
+            if (got <= 0) break;
+            const char* p = buf.data();
+            const char* const e = p + got;
+            while (p < e) {
+                const char* nl = (const char*) std::memchr(p, '\n', (size_t) (e - p));
+                if (!nl) {
+                    line.append(p, e);
+                    break;
+                }
+                line.append(p, nl);
+                take(line);
+                line.clear();
+                p = nl + 1;
+            }
+        }
+        if (!line.empty()) take(line);
+        finish();
     }
     // the next queued line and its request number (0: not a request): waiting for one (at most `most`) when wait, else
     // only if one is there
@@ -95,6 +146,8 @@ struct Input {
         line = std::move(lines.front().first);
         n = lines.front().second;
         lines.pop_front();
+        taken_ns = stamps.front();
+        stamps.pop_front();
         return true;
     }
     bool closed() {

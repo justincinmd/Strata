@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,43 @@ constexpr int FF_CARD_MAX = (FF + 32 * NCARD - 1) / (32 * NCARD) * 32;
 // the shared expert's FF slice on a card, at most, for its fused path inside the routed launches (dense.cuh)
 constexpr int SH_MAXF = FF_CARD_MAX > 256 ? FF_CARD_MAX : 256;
 static_assert(NQH % NCARD == 0, "the attention's query heads split evenly over the cards");
+// FNX_ATT_HEADS (build option STRATA_SPLIT_APPROX, Flash-Next only): the attention split by heads
+// instead of by position. Card c projects and attends its NQH / NCARD query heads (c * NQH / NCARD ..) and holds the K/V
+// rows of their one KV head for EVERY position (on 4 cards each KV head's rows are on two cards). No merge across the
+// cards: each card's gated output is its heads' (what the merge writes by position), so the output projection and its sum
+// are unchanged. kernels.hpp has the K/V row helpers (kv_mine, kv_local_row).
+#ifndef FNX_ATT_HEADS
+#define FNX_ATT_HEADS 0
+#endif
+constexpr bool ATT_HEADS = FNX_ATT_HEADS != 0;
+#if FNX_ATT_HEADS && FNX_27B
+#error "FNX_ATT_HEADS is a Flash-Next layout (the 27B keeps its own attention)"
+#endif
+// FNX_ROUTER_BF16 (build option STRATA_SPLIT_FAST): the router's table a second time as bf16 for k_router_route,
+// when every one of its f32 values is a bf16 value (low 16 bits zero: the files' routers are), so half the bytes come from DRAM and
+// every logit keeps its bits. FNX_ROUTER_BF16=0|1|2 at run time (kernels.hpp router_bf16_mode). The f32 table stays for the prompt
+// path (prefill.cu) and for a layer whose values are not exact.
+#ifndef FNX_ROUTER_BF16
+#define FNX_ROUTER_BF16 0
+#endif
+#if FNX_ROUTER_BF16 && FNX_27B
+#error "FNX_ROUTER_BF16 is for the routed-expert models (the 27B has no router)"
+#endif
+// FNX_ATT_MM (build option STRATA_SPLIT_APPROX, needs FNX_ATT_HEADS, gfx12): the decode window's attention part as matrix
+// products and a faster block selection for deep context (attn_mm.cuh). FNX_ATT_MM=0 in the environment runs the kernels of a build without it
+#ifndef FNX_ATT_MM
+#define FNX_ATT_MM 0
+#endif
+#if FNX_ATT_MM && !FNX_ATT_HEADS
+#error "FNX_ATT_MM needs FNX_ATT_HEADS (STRATA_SPLIT_APPROX)"
+#endif
+constexpr int NQH_LOC = ATT_HEADS ? NQH / NCARD : NQH;   // query heads a card projects and attends (qg's heads)
+constexpr int KVH_LOC = ATT_HEADS ? 1 : NKVH;            // KV heads a card projects, normalizes and keeps rows of
+constexpr int QG_W = NQH_LOC * 2 * HD;                   // floats of a row of qg (q | gate per head)
+constexpr int KV_W = KVH_LOC * HD;                       // floats of a row of k or v, values of a K/V row
+static_assert(!ATT_HEADS || (NQH / NKVH) % (NQH / NCARD) == 0, "FNX_ATT_HEADS: a card's query heads share one KV head");
+// the first KV head card c projects (by heads its query heads' one; by position 0: both)
+constexpr int kv_head0(int card) { return ATT_HEADS ? card * (NQH / NCARD) / (NQH / NKVH) : 0; }
 
 inline bool is_attn(int l) { return (l + 1) % 4 == 0; }
 
@@ -124,6 +162,9 @@ struct LayerW {
     Q8S hc_up[2];                      // [D][LR]
     uint16_t* hc_inj[2] = {};          // bf16 [HC][D]
     float* router = nullptr;           // f32 [NEXP + 1][N]: the router's rows, then the shared expert's gate
+#if FNX_ROUTER_BF16
+    uint16_t* router_bf = nullptr;     // the same table as bf16 in k_router_route's lane order (router_bf16_pack), or null (not exact, or switched off)
+#endif
     // recurrent slice: this card's key heads and their value heads
     DW qkv, z, ssm_out;                // qkv rows: q (nk*HS), k (nk*HS), v (nv*HS); ssm_out: [N][nv*HS]
     DW qkvz;                           // qkv rows then z rows, one matrix
@@ -156,6 +197,41 @@ struct LayerW {
     DW ffn_gu, ffn_down;
 #endif
 };
+
+#if FNX_ROUTER_BF16
+inline const uint16_t* router_bf_of(const LayerW& L) { return L.router_bf; }
+// The bf16 table's order. k_router_route reads a logit row in two halves (a warp each); a lane holds RR_NC float4 chunks of its half,
+// chunk i at float4 i * 32 + lane. Here the lane's chunks 2j and 2j + 1 lie side by side, 8 values = one 128-bit load:
+//   out[row][half * N / 2 + (j * 32 + lane) * 8 + k] = W[row][4 * (half * NC * 32 + (2 j + k / 4) * 32 + lane) + k % 4]
+// so the kernel rebuilds the very float4 chunks the f32 table gave it, and a warp's loads stay one coalesced run of 512 bytes.
+constexpr int ROUTER_BF_WPR = 2, ROUTER_BF_NC = N / 4 / 32 / ROUTER_BF_WPR;   // moe.cuh: RR_WPR, NC (checked there)
+static_assert(ROUTER_BF_NC % 2 == 0 && ROUTER_BF_NC * 4 * 32 * ROUTER_BF_WPR == N, "router_bf16_pack: N in whole pairs of float4 chunks a lane");
+// are all n values bf16 values (the low 16 bits of each f32 zero)?
+inline bool router_bf16_exact(const float* W, size_t n) {
+    uint32_t low = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t u;
+        std::memcpy(&u, W + i, 4);
+        low |= u;
+    }
+    return (low & 0xffffu) == 0;
+}
+// rows rows of N exact values (router_bf16_exact) into out, rows * N bf16 values in the order above
+inline void router_bf16_pack(const float* W, size_t rows, uint16_t* out) {
+    constexpr int NC = ROUTER_BF_NC;
+    for (size_t r = 0; r < rows; ++r)
+        for (int h = 0; h < ROUTER_BF_WPR; ++h)
+            for (int j = 0; j < NC / 2; ++j)
+                for (int l = 0; l < 32; ++l)
+                    for (int k = 0; k < 8; ++k) {
+                        uint32_t u;
+                        std::memcpy(&u, W + r * N + 4 * ((size_t) h * NC * 32 + (size_t) (2 * j + k / 4) * 32 + l) + k % 4, 4);
+                        out[r * N + (size_t) h * (N / ROUTER_BF_WPR) + (size_t) (j * 32 + l) * 8 + k] = (uint16_t) (u >> 16);
+                    }
+}
+#else
+inline const uint16_t* router_bf_of(const LayerW&) { return nullptr; }
+#endif
 
 struct CardW {
     int dev = 0;

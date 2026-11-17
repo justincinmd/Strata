@@ -22,16 +22,26 @@ inline CUresult cuGetErrorString(CUresult e, const char** s) {
 // A wait that does not see its value within ~4 s sets bit 1 of nothing and returns (the engine's ring error check then catches the sum).
 #include <cstdlib>
 #include <cstring>
+#include "evict_watch.h"
 static __global__ void fnx_memop_write(volatile unsigned* p, unsigned v) {
     __threadfence_system();   // everything this stream wrote before (the copy engine's / kernels' stores into host memory) first
     *p = v;
     __threadfence_system();
 }
-static __global__ void fnx_memop_wait(volatile unsigned* p, unsigned v) {
-    const long long t0 = clock64();
+// `watch` (null: off) is the host's eviction watch word (kernels.hpp DG_WATCH_LO, WAIT_EVICT_WINDOW_MS; the same rule as
+// diag.cuh diag_wait_on with this wait's 8e9 cycles): the wait begins again while the driver stopped the process's queues a moment ago
+static __global__ void fnx_memop_wait(volatile unsigned* p, unsigned v, const unsigned long long* watch) {
+    long long t0 = clock64(), moved = 0;
+    bool graced = false;
     while ((int) (*p - v) < 0) {   // wrapping >=
         __builtin_amdgcn_s_sleep(1);
-        if (clock64() - t0 > 8000000000LL) break;
+        if (const long long dt = clock64() - t0; dt > 8000000000LL) {
+            if (!watch || moved >= 200000000000LL) break;
+            const unsigned long long w = *(const volatile unsigned long long*) watch;
+            if ((unsigned) (w >> 32) - (unsigned) w <= 3814u + 250u) t0 += dt, moved += dt, graced = false;   // 8e9 >> 21 ms + the window
+            else if (!graced) graced = true, t0 += dt - 8000000000LL + (1LL << 28), moved += dt - 8000000000LL + (1LL << 28);
+            else break;
+        }
     }
     __threadfence_system();
 }
@@ -48,7 +58,7 @@ inline CUresult cuStreamWriteValue32(CUstream s, CUdeviceptr p, uint32_t v, unsi
 }
 inline CUresult cuStreamWaitValue32(CUstream s, CUdeviceptr p, uint32_t v, unsigned flags) {
     if (fnx_native_memops()) return hipStreamWaitValue32(s, reinterpret_cast<void*>(p), static_cast<int32_t>(v), flags, 0xffffffffu);
-    fnx_memop_wait<<<1, 1, 0, s>>>(reinterpret_cast<volatile unsigned*>(p), v);
+    fnx_memop_wait<<<1, 1, 0, s>>>(reinterpret_cast<volatile unsigned*>(p), v, fnx_evict_watch.load(std::memory_order_relaxed));
     return hipGetLastError();
 }
 inline CUresult cuInit(unsigned) { return hipInit(0); }

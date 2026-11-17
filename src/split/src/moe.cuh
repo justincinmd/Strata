@@ -70,13 +70,30 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
     }
 }
 
+// FNX_ROUTER_BF16 (model.hpp, build option STRATA_SPLIT_FAST). Without it the kernel is the one below, token for token as it was. With it the
+// kernel has a second parameter BF that picks the table: 0: W is the f32 table (the same statements). 1: W is the bf16 table in router_bf16_pack's
+// order: a lane's two float4 chunks come in one 128-bit load and are widened (bits << 16), then the same products and sums in the same order, so
+// every logit has the bits of BF 0's. 2: the bf16 table with one warp a logit row (8 rows a block, half the blocks): the warp does the row's two halves
+// one after the other; each half's sum and the sum of the two are again the same operations. What follows the logits (the picks, the jobs, the cache
+// plan) is one text for all of them.
+#if !FNX_ROUTER_BF16
 template <int T>
 __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
                                                             float* __restrict__ logits, int* __restrict__ topi,
                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
-                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su) {
+                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su
+#if FNX_MALL_PF
+                                                            ,
+                                                            unsigned* pf, int pf_late
+#endif
+) {
     static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the router's launch");
+#if FNX_MALL_PF
+    // this layer's event for the persistent cache prefetcher (k_mall_pf_run): one more, by the one thread (device scope, as
+    // the prefetcher's loads of it). pf_late 0: here, at the router's start; 1: below, when every logit is written (the expert kernels come next)
+    if (pf && !pf_late && blockIdx.x == 0 && threadIdx.x == 0) atomicAdd(pf, 1u);
+#endif
     constexpr int NC = N / 4 / 32 / RR_WPR, L = NEXP + 1;   // float4 chunks per lane
     const int nrr = (int) gridDim.x - su.blocks;              // the router's own blocks; the shared expert's after them
     if ((int) blockIdx.x >= nrr) {
@@ -90,7 +107,7 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
         const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + half * NC * 32;
         float4 wv[NC];
 #pragma unroll
-        for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+        for (int i = 0; i < NC; ++i) wv[i] = FNX_WLD2(w4 + i * 32 + lane);
         // unrolled over the tokens: each pair's x loads and sums run beside the others' (rolled, the pairs waited on
         // each other: one wave of blocks, so latency set the time). Each logit's summation order is unchanged
 #pragma unroll
@@ -118,12 +135,126 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
         const int t = q / RR_ROWS, r = q % RR_ROWS, lrow = blockIdx.x * RR_ROWS + r;
         if (lrow < L) logits[(size_t) t * L + lrow] = rsum[t][r * RR_WPR] + rsum[t][r * RR_WPR + 1];
     }
+#else
+constexpr int rr_rows(int bf) { return bf == 2 ? RR_THREADS / 32 : RR_ROWS; }   // logit rows a block
+template <int T, int BF>
+__global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
+                                                            float* __restrict__ logits, int* __restrict__ topi,
+                                                            float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
+                                                            int* __restrict__ njobs, unsigned* __restrict__ counter,
+                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su
+#if FNX_MALL_PF
+                                                            ,
+                                                            unsigned* pf, int pf_late
+#endif
+) {
+    static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the router's launch");
+    static_assert(RR_WPR == 2, "a logit is the sum of two halves");
+#if FNX_MALL_PF
+    if (pf && !pf_late && blockIdx.x == 0 && threadIdx.x == 0) atomicAdd(pf, 1u);   // this layer's event (see the kernel above)
+#endif
+    static_assert(BF >= 0 && BF <= 2 && ROUTER_BF_WPR == RR_WPR && ROUTER_BF_NC == N / 4 / 32 / RR_WPR, "the bf16 table's order is this kernel's");
+    constexpr int NC = N / 4 / 32 / RR_WPR, L = NEXP + 1;   // float4 chunks per lane
+    const int nrr = (int) gridDim.x - su.blocks;              // the router's own blocks; the shared expert's after them
+    if ((int) blockIdx.x >= nrr) {
+        shexp_up_block<T>(su, blockIdx.x - nrr);
+        return;
+    }
+    const int e = threadIdx.x, warp = e >> 5, lane = e & 31;
+    if constexpr (BF == 0) {   // the f32 table: the statements of the kernel above
+        const int rw = warp / RR_WPR, half = warp % RR_WPR;
+        const int row = blockIdx.x * RR_ROWS + rw;
+        __shared__ float rsum[T][RR_THREADS / 32];
+        if (row < L) {
+            const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + half * NC * 32;
+            float4 wv[NC];
+#pragma unroll
+            for (int i = 0; i < NC; ++i) wv[i] = FNX_WLD2(w4 + i * 32 + lane);
+            // unrolled over the tokens: each pair's x loads and sums run beside the others' (rolled, the pairs waited on
+            // each other: one wave of blocks, so latency set the time). Each logit's summation order is unchanged
+#pragma unroll
+            for (int t = 0; t < T; t += 2) {
+                const bool two = t + 1 < T;
+                const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * N) + half * NC * 32;
+                const float4* y4 = two ? x4 + N / 4 : x4;
+                float a = 0.f, c = 0.f;
+#pragma unroll
+                for (int i = 0; i < NC; ++i) {
+                    const float4 b = x4[i * 32 + lane], d = y4[i * 32 + lane];
+                    a += wv[i].x * b.x + wv[i].y * b.y + wv[i].z * b.z + wv[i].w * b.w;
+                    c += wv[i].x * d.x + wv[i].y * d.y + wv[i].z * d.z + wv[i].w * d.w;
+                }
+                a = wsum(a);
+                c = wsum(c);
+                if (lane == 0) {
+                    rsum[t][warp] = a;
+                    if (two) rsum[t + 1][warp] = c;
+                }
+            }
+        }
+        __syncthreads();
+        for (int q = e; q < T * RR_ROWS; q += RR_THREADS) {
+            const int t = q / RR_ROWS, r = q % RR_ROWS, lrow = blockIdx.x * RR_ROWS + r;
+            if (lrow < L) logits[(size_t) t * L + lrow] = rsum[t][r * RR_WPR] + rsum[t][r * RR_WPR + 1];
+        }
+    } else {
+        constexpr int WPR = BF == 2 ? 1 : RR_WPR, ROWS = RR_THREADS / 32 / WPR, NH = RR_WPR / WPR;   // warps a row, rows a block, halves a warp
+        static_assert(NC % 2 == 0 && N % 16 == 0, "two float4 chunks a 128-bit load of bf16");
+        const int rw = warp / WPR, row = blockIdx.x * ROWS + rw;
+        __shared__ float rsum[T][RR_THREADS / 32 * NH];   // [row of the block][half]
+        if (row < L) {
+#pragma unroll
+            for (int hh = 0; hh < NH; ++hh) {
+                const int half = NH == 2 ? hh : warp % RR_WPR, slot = NH == 2 ? warp * 2 + hh : warp;
+                // plain loads (a non-temporal stream of a table this small costs time)
+                const uint4* b4 = reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned short*>(W) + (size_t) row * N + half * (N / 2));
+                float4 wv[NC];
+#pragma unroll
+                for (int j = 0; j < NC / 2; ++j) {
+                    const uint4 u = __ldg(b4 + j * 32 + lane);   // 8 bf16: chunk 2j's x y z w, then chunk 2j + 1's
+                    wv[2 * j] = make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u), __uint_as_float(u.y << 16),
+                                            __uint_as_float(u.y & 0xffff0000u));
+                    wv[2 * j + 1] = make_float4(__uint_as_float(u.z << 16), __uint_as_float(u.z & 0xffff0000u), __uint_as_float(u.w << 16),
+                                                __uint_as_float(u.w & 0xffff0000u));
+                }
+                // the sums as in the f32 branch, statement for statement
+#pragma unroll
+                for (int t = 0; t < T; t += 2) {
+                    const bool two = t + 1 < T;
+                    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * N) + half * NC * 32;
+                    const float4* y4 = two ? x4 + N / 4 : x4;
+                    float a = 0.f, c = 0.f;
+#pragma unroll
+                    for (int i = 0; i < NC; ++i) {
+                        const float4 b = x4[i * 32 + lane], d = y4[i * 32 + lane];
+                        a += wv[i].x * b.x + wv[i].y * b.y + wv[i].z * b.z + wv[i].w * b.w;
+                        c += wv[i].x * d.x + wv[i].y * d.y + wv[i].z * d.z + wv[i].w * d.w;
+                    }
+                    a = wsum(a);
+                    c = wsum(c);
+                    if (lane == 0) {
+                        rsum[t][slot] = a;
+                        if (two) rsum[t + 1][slot] = c;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        for (int q = e; q < T * ROWS; q += RR_THREADS) {
+            const int t = q / ROWS, r = q % ROWS, lrow = blockIdx.x * ROWS + r;
+            if (lrow < L) logits[(size_t) t * L + lrow] = rsum[t][r * RR_WPR] + rsum[t][r * RR_WPR + 1];
+        }
+    }
+#endif
     __shared__ bool last;
     __threadfence();
     __syncthreads();
     if (e == 0) last = atomicAdd(counter, 1u) == (unsigned) nrr - 1;
     __syncthreads();
     if (!last) return;
+#if FNX_MALL_PF
+    if (pf && pf_late && e == 0) atomicAdd(pf, 1u);   // the event of "the logits are done" (the one block that is last)
+#endif
     __threadfence();
     // top 10 per token: warp w takes tokens w, w + 8, ...; lane l holds experts l + 32 i
     __shared__ int ex[MAXT * TOPK];
@@ -133,39 +264,80 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
         float v[NEXP / 32];
 #pragma unroll
         for (int i = 0; i < NEXP / 32; ++i) v[i] = __ldcg(logits + (size_t) t * L + lane + 32 * i);
+        // A lane's three best experts, best first (of equal values the lower expert first: the order a scan for the maximum takes them in), found
+        // once: a pick then takes its candidate from registers, where it was a scan of the lane's 16 values a pick. A lane that has given its
+        // three (rare) finds the next three among the experts it has not given. No expert left in a lane: -inf and NEXP, as the scan had it.
+        // (One place in the text and selects, no branches a value: as a lambda with two calls the lane's values lived in memory.)
         unsigned taken = 0;
-        float top0 = 0.f, z = 0.f, wk = 0.f;
+        float c0 = 0.f, c1 = 0.f, c2 = 0.f;
+        int j0 = 0, j1 = 0, j2 = 0, ptr = 3;   // 3: the lane has no candidates (every lane before the first pick)
+        float top0 = 0.f, mk = 0.f;
 #pragma unroll 1
         for (int k = 0; k < TOPK; ++k) {
-            float bv = -INFINITY;
-            int bi = NEXP;
+            if (__ballot_sync(0xffffffffu, ptr == 3)) {   // (the ballot: one branch for the warp)
+                float n0 = -INFINITY, n1 = -INFINITY, n2 = -INFINITY;
+                int i0 = NEXP / 32, i1 = NEXP / 32, i2 = NEXP / 32;
 #pragma unroll
-            for (int i = 0; i < NEXP / 32; ++i)
-                if (!(taken >> i & 1u) && v[i] > bv) { bv = v[i]; bi = lane + 32 * i; }
+                for (int i = 0; i < NEXP / 32; ++i) {
+                    const float xv = (taken >> i & 1u) ? -INFINITY : v[i];   // (-inf is never greater: no candidate, as a logit of -inf or NaN)
+                    const bool g0 = xv > n0, g1 = xv > n1, g2 = xv > n2;      // n0 >= n1 >= n2: g0 implies g1 implies g2
+                    n2 = g1 ? n1 : g2 ? xv : n2;
+                    i2 = g1 ? i1 : g2 ? i : i2;
+                    n1 = g0 ? n0 : g1 ? xv : n1;
+                    i1 = g0 ? i0 : g1 ? i : i1;
+                    n0 = g0 ? xv : n0;
+                    i0 = g0 ? i : i0;
+                }
+                const bool re = ptr == 3;
+                c0 = re ? n0 : c0, c1 = re ? n1 : c1, c2 = re ? n2 : c2;
+                j0 = re ? i0 : j0, j1 = re ? i1 : j1, j2 = re ? i2 : j2;
+                ptr = re ? 0 : ptr;
+            }
+            const float bv = ptr == 0 ? c0 : ptr == 1 ? c1 : c2;
+            const int bj = ptr == 0 ? j0 : ptr == 1 ? j1 : j2, bi = bj < NEXP / 32 ? lane + 32 * bj : NEXP;
+            // the warp's best value by five exchanges of the value alone, and its lane by a ballot: the pick of a reduce over (value, expert) pairs
+            // with half the exchanges. Equal values in two lanes (rare): the lower expert wins, by a second reduce over the experts of those lanes
+            // (nothing left to pick: every lane holds -inf and NEXP, and lane NEXP % 32 = 0 does the pick's stores)
+            float m = bv;
 #pragma unroll
             for (int o = 16; o; o >>= 1) {
-                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+                const float ov = __shfl_xor_sync(0xffffffffu, m, o);
+                if (ov > m) m = ov;
             }
-            if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
-            if (k == 0) top0 = bv;
-            const float ek = __expf(bv - top0);
-            z += ek;
-            if (lane == k) {
-                wk = ek;
+            const unsigned eq = __ballot_sync(0xffffffffu, bv == m);
+            int win = __ffs(eq) - 1;
+            if (eq & (eq - 1)) {
+                int mi = bv == m ? bi : 0x7fffffff;
+#pragma unroll
+                for (int o = 16; o; o >>= 1) {
+                    const int oi = __shfl_xor_sync(0xffffffffu, mi, o);
+                    if (oi < mi) mi = oi;
+                }
+                win = mi & 31;
+            }
+            if (k == 0) top0 = m;
+            if (lane == k) mk = m;
+            if (lane == win) {
+                taken |= 1u << (bi >> 5);
+                ++ptr;
                 topi[t * TOPK + k] = bi;
                 ex[t * TOPK + k] = bi;
             }
         }
-        if (lane < TOPK) topw[t * TOPK + lane] = wk / z;
+        // the picks' weights: lane k holds pick k's logit. One exp in every lane, then their sum in the picks' order (the order the picks' loop
+        // added them in)
+        const float ek = __expf(mk - top0);
+        float z = 0.f;
+#pragma unroll
+        for (int k = 0; k < TOPK; ++k) z += __shfl_sync(0xffffffffu, ek, k);
+        if (lane < TOPK) topw[t * TOPK + lane] = ek / z;
     }
     __syncthreads();
     // jobs: one per distinct expert, numbered in the order of each expert's first pick; a pair takes the next slot of
     // its expert's job (the order of a job's rows does not matter)
     constexpr int P = T * TOPK;
     __shared__ int firstpair[NEXP], slots[NEXP], jobof[NEXP];
-    __shared__ unsigned char first[MAXT * TOPK];
+    __shared__ int wfirst[RR_THREADS / 32];   // a warp's first pairs
     for (int x2 = e; x2 < NEXP; x2 += RR_THREADS) {
         firstpair[x2] = P;
         slots[x2] = 0;
@@ -173,11 +345,14 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
     __syncthreads();
     if (e < P) atomicMin(&firstpair[ex[e]], e);
     __syncthreads();
-    if (e < P) first[e] = firstpair[ex[e]] == e;
+    // the first pairs before pair e = those under its lane in its warp's ballot + the warps before it
+    const bool isfirst = e < P && firstpair[ex[e]] == e;
+    const unsigned fb = __ballot_sync(0xffffffffu, isfirst);
+    if (lane == 0) wfirst[warp] = __popc(fb);
     __syncthreads();
-    if (e < P && first[e]) {
-        int j = 0;
-        for (int q = 0; q < e; ++q) j += first[q];
+    if (isfirst) {
+        int j = __popc(fb & ((1u << lane) - 1u));
+        for (int q = 0; q < warp; ++q) j += wfirst[q];
         jobof[ex[e]] = j;
         gu[j].w = dn[j].w = ex[e];
     }
@@ -188,11 +363,11 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
         gu[j].out[s] = dn[j].y[s] = dn[j].out[s] = e;
     }
     __syncthreads();
-    if (e < P && first[e]) gu[jobof[ex[e]]].n = dn[jobof[ex[e]]].n = slots[ex[e]];
+    if (isfirst) gu[jobof[ex[e]]].n = dn[jobof[ex[e]]].n = slots[ex[e]];
     __shared__ int nj;
     if (e == P) {
         int n = 0;
-        for (int q = 0; q < P; ++q) n += first[q];
+        for (int q = 0; q < RR_THREADS / 32; ++q) n += wfirst[q];
         njobs[0] = nj = n;
         *counter = 0u;
     }
@@ -234,6 +409,37 @@ __device__ __forceinline__ void job_store(const float* tmp, int n, bool live, in
     }
 }
 
+#if FNX_MALL_NT && FNX_HIP
+// unit_dot with the unit's weight blocks read once, with non-temporal loads, into registers (unit_w), then ggml's dot on that copy per
+// activation row (unit_dot_w): the same integers and floats. For the 32-value block types, whose block a thread reads whole either way; nt_blk_bytes is 0
+// for the other types, which keep ggml's loads (unit_dot).
+template <GgmlType type> constexpr int nt_blk_bytes() {
+    return type == T_Q5_1 ? (int) sizeof(block_q5_1) : type == T_Q8_0 ? (int) sizeof(block_q8_0) : type == T_Q4_0 ? (int) sizeof(block_q4_0) : 0;
+}
+template <GgmlType type, int U> constexpr bool nt_unit() { return nt_blk_bytes<type>() != 0 && U % qtraits<type>::qk == 0; }
+template <GgmlType type, int U> struct UnitW {
+    // SH: a block with a 2-byte header (Q8_0, Q4_0) sits 2 bytes into its slot, so that its words are at multiples of 4 of the array
+    static constexpr int NB = nt_blk_bytes<type>(), SH = NB % 4, PAD = (SH + NB + 3) / 4 * 4, K = U / qtraits<type>::qk;
+    alignas(4) char loc[K * PAD > 0 ? K * PAD : 4];
+};
+template <GgmlType type, int U> __device__ __forceinline__ void unit_w(UnitW<type, U>& w, const char* wrow, int u) {
+    constexpr int NB = UnitW<type, U>::NB, SH = UnitW<type, U>::SH, PAD = UnitW<type, U>::PAD, K = UnitW<type, U>::K;
+#pragma unroll
+    for (int b = 0; b < K; ++b) fnx_nt::copy<NB>(w.loc + b * PAD + SH, wrow + (size_t) (u * K + b) * NB);
+}
+template <GgmlType type, int U> __device__ __forceinline__ float unit_dot_w(const UnitW<type, U>& w, int u, const block_q8_1* y) {
+    constexpr int qk = qtraits<type>::qk, qi = qtraits<type>::qi, vdr = vdr_of<type>();
+    constexpr int SH = UnitW<type, U>::SH, PAD = UnitW<type, U>::PAD, K = UnitW<type, U>::K;
+    float s = 0.f;
+#pragma unroll
+    for (int b = 0; b < K; ++b) {
+        const int kbx = u * K + b;
+#pragma unroll
+        for (int i = 0; i < qi / vdr; ++i) s += vdot<type>(w.loc + b * PAD + SH, y + kbx * (qk / QK8_1), 0, vdr * i);
+    }
+    return s;
+}
+#endif
 // one thread's dot of U columns of a weight row (its unit `u`) with one q8_1 activation row
 template <GgmlType type, int U>
 __device__ __forceinline__ float unit_dot(const char* wrow, int u, const block_q8_1* y) {
@@ -332,6 +538,13 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
     const bool live = r < rpb && row < w.nrows;
     if (live) {
         const char* wr = moe_expert(w, jb.w) + (size_t) row * w.row_a;
+#if FNX_MALL_NT && FNX_HIP
+        if constexpr (nt_unit<TA, DN_U>()) {
+            UnitW<TA, DN_U> uw;
+            unit_w<TA, DN_U>(uw, wr, u);
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot_w<TA, DN_U>(uw, u, hq[j]);
+        } else
+#endif
         for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
     }
     __syncthreads();
@@ -391,6 +604,11 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
     const int row = blockIdx.x * rpb + r;
     const bool live = r < rpb && row < w.nrows;
     const char* wr = moe_expert(w, jb.w) + (size_t) (live ? row : 0) * w.row_a;
+#if FNX_MALL_NT && FNX_HIP
+    UnitW<TA, DN_U> uw;   // the thread's weights once, non-temporal (the passes below read this copy)
+    if constexpr (nt_unit<TA, DN_U>())
+        if (live) unit_w<TA, DN_U>(uw, wr, u);
+#endif
 #pragma unroll 1
     for (int b0 = 0; b0 < jb.n; b0 += MAXT) {
         const int n = min(MAXT, jb.n - b0);
@@ -404,8 +622,14 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
             if (lane == 0) hq[j][b].ds = make_half2(__float2half(d), __float2half(sm));
         }
         __syncthreads();
-        if (live)
+        if (live) {
+#if FNX_MALL_NT && FNX_HIP
+            if constexpr (nt_unit<TA, DN_U>()) {
+                for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot_w<TA, DN_U>(uw, u, hq[j]);
+            } else
+#endif
             for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        }
         __syncthreads();
         for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
             const int j = e / rpb, rr = e % rpb, orow = blockIdx.x * rpb + rr;

@@ -39,6 +39,23 @@ bool ring_f32();
 // Read at each call like ring_f32 (the Engine and the lab's identity record); anything else not above 1 throws
 double rope_scale();
 
+// the host's eviction watch (engine_common.cu). One thread a process samples KFD's evicted_ms of this process's cards (every 10 ms
+// while the engine works, else every 50 ms) and keeps one word of page-locked host memory that the cards can read: bits 63..32 its clock in ms, bits
+// 31..0 the clock at the last sample in which evicted_ms had risen (the driver adds an eviction's time when the card's queues are back).
+struct EvictStats {
+    bool on = false;                     // the watch runs (false too after its thread ended on an error)
+    int files = 0;                       // evicted_ms files it reads
+    unsigned long long bursts = 0;       // runs of samples with a rise
+    unsigned long long evicted_ms = 0;   // the rises, summed (a sample's rise: the largest of its cards)
+    unsigned long long longest_ms = 0;   // the largest rise of one sample
+    unsigned long long samples = 0;
+    unsigned long long read_fails = 0;   // reads of an evicted_ms file that failed
+    long long age_ms = -1;               // from the last rise to the last sample (-1: no rise yet)
+};
+const unsigned long long* evict_watch_word();   // starts the watch at the first call (a device current); null: no KFD files, or no host page
+void evict_watch_touch();                       // the engine works: sample fast for the next seconds
+EvictStats evict_watch_stats();
+
 class Engine {
 public:
     // lanes: how many add_lane() blocks the K/V pool has room for on top of max_ctx positions
@@ -118,6 +135,7 @@ public:
     // segment into a host ring per lane that the drafter takes at its first round
     void df2_attach(df2::Bridge& br);
     bool df2_on() const { return df2_ != nullptr; }
+    bool mtp_on() const { return mtp_ != nullptr; }   // the draft layer is attached
     struct Df2Req {
         int lane = 0, row0 = 0, used = 1, pos0 = 0, anchor = 0;   // rows row0 .. row0 + used - 1 of the last window were kept, the first at position pos0
         int tokens[df2::kDrafts] = {};
@@ -217,6 +235,27 @@ public:
     double last_ms = 0.0;        // wall time of the last window()
     double last_embed_ms = 0.0;  // its host embedding (token and PLE rows from the mapping)
     double last_gpu_ms = 0.0;    // its GPU time: the slowest card, from the inputs' upload to the results' download
+    // what a window costs on THIS rig, fitted while it runs: GPU ms = a + b * rows (a decayed least-squares line; [0] verify(), the one-user
+    // window, [1] verify_rows() on held graphs) and the mean wall ms of a one-row draft call. Reported by FNX_SOLO_STATS / FNX_BATCH_STATS so the planners'
+    // costs can be set for the rig (FNX_PLAN_*_MS), and used by them directly with FNX_PLAN_LIVE=1. get() is false until ~40 windows of a few different
+    // row counts were seen
+    struct CostFit {
+        double s0 = 0, s1 = 0, s2 = 0, y0 = 0, y1 = 0;
+        void add(int rows, double ms) {
+            constexpr double D = 0.998;
+            s0 = s0 * D + 1.0, s1 = s1 * D + rows, s2 = s2 * D + (double) rows * rows, y0 = y0 * D + ms, y1 = y1 * D + rows * ms;
+        }
+        bool get(double& a, double& b) const {
+            const double den = s0 * s2 - s1 * s1;
+            if (s0 < 40.0 || den < 0.25 * s0 * s0) return false;   // rows' variance at least 0.25
+            b = (s0 * y1 - s1 * y0) / den;
+            a = (y0 - b * s1) / s0;
+            return b > 0.05 && b < 20.0 && a > 0.5 && a < 200.0;   // a line that makes no sense is not used
+        }
+    };
+    CostFit cost_fit[2];
+    double draft_call_fit = 0.0;   // decayed mean wall ms of draft() calls of one row; 0: none yet
+    long draft_calls_fit = 0;
     double last_card_ms[NCARD] = {};   // each card's (a card that starts first waits at the first ring sum for the others)
     double last_launch_ms = 0.0; // the host time of its three graph launches
     double last_capture_ms = 0.0;   // the last verify_rows()'s graph capture (0: its layout's graph was cached)
@@ -290,6 +329,62 @@ private:
     // ~2.3 ms after card 0, which waited at its first ring sum
     std::shared_ptr<CardPool> pool_;
     void on_cards(const std::function<void(int)>& f);
+    std::string err_words() const;   // " (error words by card: ...)" for a window error
+    // time-out diagnostics. A window error's report (stderr lines "sfnx: diag: ...") is printed before the error is thrown: each
+    // card's first time-out (kernels.hpp ErrDiag), the host's last on_cards() calls, the cards' memory. The success path pays the clock reads below.
+    struct DiagRun {                     // one on_cards() call
+        long long wall_us = 0;           // the system clock at its start, microseconds since the epoch
+        std::chrono::steady_clock::time_point t0{};
+        int start_us[NCARD] = {};        // card c's job: its start after t0 and how long it took (-1: it did not start / did not return)
+        int took_us[NCARD] = {};
+        unsigned long win = 0;           // not 0: the call launched main window `win`'s graphs
+        int gl_start_us[NCARD] = {};     // then: card c's graph launch call, its start after t0 and how long the call took
+        int gl_took_us[NCARD] = {};
+        int sy_start_us[NCARD] = {};     // and the host's wait for the card's stream after it (diag_sync): its start after t0 and how long it waited
+        int sy_took_us[NCARD] = {};
+    };
+    DiagRun* diag_win_run_ = nullptr;    // the last main window's on_cards() record (null: that window was not launched through on_cards)
+    // The time the kernel driver kept this process's queues off the cards (KFD's evicted_ms, /sys/class/kfd/kfd/proc/<pid>/stats_<gpu>/evicted_ms):
+    // an eviction (a page of the process's host memory moved, a user-pointer range invalidated) stops EVERY card's kernels; the cards stop and come
+    // back one after another. Sampled for the report at most once in DIAG_KFD_S seconds (four small reads), and at a report. (The eviction watch
+    // below samples the same files much faster for the waits.)
+    static constexpr int DIAG_KFD_MAX = 8;
+    static constexpr int DIAG_KFD_S = 5;
+    struct DiagKfd {
+        std::chrono::steady_clock::time_point at{};
+        int n = -1;                      // files read (-1: no sample)
+        unsigned long win = 0;
+        unsigned long long ms[DIAG_KFD_MAX] = {};
+    };
+    DiagKfd diag_kfd_first_, diag_kfd_prev_, diag_kfd_last_;
+    std::vector<std::string> diag_kfd_paths_;
+    bool diag_kfd_scanned_ = false;
+    void diag_kfd_sample(DiagKfd& k);
+    void diag_sync(int c, CardBuf& b, const char* what);   // a main window's stream synchronize, stamped
+    static constexpr int DIAG_RUNS = 16;
+    DiagRun diag_runs_[DIAG_RUNS];
+    unsigned long diag_run_n_ = 0;       // on_cards() calls so far
+    unsigned long diag_slow_n_ = 0;      // those with a card's job that ended more than 20 ms after the call started
+    int diag_slow_max_us_ = 0;
+    unsigned long diag_win_ = 0;         // main windows launched (verify, step, verify_rows)
+    unsigned long diag_win_pending_ = 0; // set right before an on_cards() call that launches a main window's graphs
+    double diag_clock_mhz_[NCARD] = {};  // clock64's rate at load by the steady counter (0: not measured)
+    double diag_wall_khz_[NCARD] = {};   // the steady counter's rate (0: not known)
+    long long diag_ring_timeout_[NCARD] = {};   // the decode ring sums' time-out in cycles (diag_load)
+    // The waits ride driver evictions (kernels.hpp WAIT_EVICT_WINDOW_MS, diag.cuh diag_wait_on; the host's watch: evict_watch_word above). The cards'
+    // DG_EXT_N words come home with a main window's downloads when the 5 s sampler is due; the window after it logs a line when the driver
+    // evicted or a count rose.
+    bool diag_ext_on_ = false;           // the cards have the watch word's address
+    unsigned* diag_ext_h_ = nullptr;     // page-locked, NCARD words
+    unsigned diag_ext_seen_[NCARD] = {};
+    unsigned long long diag_ext_evicted_seen_ = 0, diag_ext_bursts_seen_ = 0;   // the watch's sums at the last line
+    bool diag_ext_due_ = false;          // this main window's launch jobs queue the copies
+    bool diag_ext_pending_ = false;      // copies queued by an earlier main window (synchronized since): compare and log
+    void diag_ext_log();
+    void diag_load(int c, CardBuf& b);   // at load, the card current: the clocks' rates, FNX_RING_TIMEOUT_CYCLES / _MS, FNX_DIAG_STALL read
+    void diag_graph_launch(int c, CardBuf& b, void* exec, bool single);   // a main window's graph launch, stamped
+    void diag_report(const char* where);   // never throws
+    void diag_stall(int c, CardBuf& b, bool single);   // FNX_DIAG_STALL (a test hook): called by card c's launch job right before its graph launch
     std::vector<int> history_;   // every token so far (the PLE n-grams read the two before)
     std::vector<int> pending_;   // the last verify's tokens, until its commit
     struct Pinned {              // per-window host copies, page-locked
@@ -314,6 +409,10 @@ private:
         int* mtp_tk_i;
         unsigned* mtp_tk_err;
         void* commit_jobs;     // per card: commit()'s CopyJobs
+        void* mtp_jobs;        // per card: draft_lanes' source-row CopyJobs (table form), MAXT each
+        char* mtp_io;          // the draft call's upload block (draft_io in engine_impl.hpp; one for all cards): mtp_ctl, mtp_pen_par, mtp_lctl,
+                               // mtp_row_pos, mtp_pen_par_l and mtp_emb point into it
+        char* mtp_res;         // per card: the draft call's downloaded result words (draft_io::RES_END bytes each)
         void* rows_commit_jobs;   // per card: commit_rows()'s, room for MAXT lanes
     } h_{};
     struct TopHost {             // top_tokens()'s page-locked copies
@@ -352,6 +451,16 @@ private:
     bool warming_ = false;
     std::map<std::vector<int>, int> seen_;
     int last_kind_ = 0;
+    // the batched draft layer's graphs (draft_lanes; CardBuf::dl_cache, the same index on every card): what the engine's side keeps
+    std::map<std::vector<int>, int> dl_seen_;   // a layout's sights before its capture
+    std::vector<int> dl_tab_key_;               // the layout whose row table the cards' mtp_lane_rows hold (empty: none)
+    bool dl_capture_off_ = false;               // a capture failed: no more of them
+  public:
+    struct DlStat {
+        unsigned long graph = 0, eager = 0, captured = 0, evicted = 0, checked = 0, check_bad = 0;
+        double cap_ms = 0.0;
+    } dl_stat;   // draft_lanes calls: through a held graph, eagerly, the captures (each also a graph call), the graphs dropped
+  private:
     void enqueue(int T, bool dumps);
     void enqueue_batch(const std::vector<int>& lanes);   // step()'s window: one row per lane
     void enqueue_rows(const std::vector<int>& lanes, const std::vector<int>& counts);   // verify_rows()'s
@@ -373,7 +482,8 @@ private:
     void df2_forget(int lane);       // the lane's sequence changed: drafter ring and host ring empty
     void df2_prompt_tap(int slot, int pos_first, int row, int n, CardBuf& b, const float* R, const float* bo, const float* inj);
     void mtp_enqueue(int T);
-    void mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T);
+    // form: -1 draft_lanes_tab(), 0 the launches a lane, 1 the table form
+    void mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T, int only = -1, int form = -1);   // only >= 0: that card's launches alone
     const Mtp* mtp_ = nullptr;
     std::vector<Pf*> pf_;
     // FNX_PF_RCCL (AMD, hip/rccl.h): the prompt's chunk sums through RCCL, loaded at run time; rccl_ holds the library and the communicators (null: the host exchange)
@@ -412,9 +522,45 @@ private:
     std::vector<int> draft_index_;   // token -> its index in the draft vocabulary, -1 if not in it (mtp_attach)
     // pieces of a layer, for the main layers and the draft layer
     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
+    void dense_qkv(const LayerW& L, CardBuf& b, int T, bool fuse);       // an attention layer's q, k and v (one launch with fuse where the build has it)
+    void dense_qkvz_ab(const LayerW& L, CardBuf& b, int nv, int T, bool fuse);   // a GDN layer's qkvz and ab (one launch with fuse where the build has it)
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
     void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
+    // FNX_HC_SUM: a window's sum of x left to the next hc read of x (one launch less); without the option, or in a window with dumps, ring_sum at once
+    void sum_later(CardBuf& b, float* x, int T, const unsigned* tag, int call, const RingMoe& m = {});
+    void sum_done(int lo, int hi) const;                          // throws if a sum of those cards is still pending (a window's end)
+    void sum_flush(CardBuf& b);                                   // a pending sum launched now (before anything but that read uses x)
+    const HcSumReq* sum_take(CardBuf& b, const float* bo, int T);   // the pending sum of bo for hc_read, or null (another pending sum: launched)
+    bool sum_now_ = false;                                        // this window's sums at once (dumps read the buffers between the kernels)
+    // (FNX_MALL_PF): the next layer's fixed weights staged into the card's Infinity Cache on a side stream, forked at `point` of
+    // layer L (1 moe: before the router, 2 mlp: before the FFN half's hc read, 3 mix: before the mixer's output projection) and joined once at the
+    // window's end (FNX_MALL_PF_HCJOIN=1: also before every hc read, mall_pf_hc; mlp then forks at point 4, after the FFN half's hc read).
+    // mall_pf_plan builds the sets at load and logs them.
+    // Without the build option the three are empty inline functions and the engine has no prefetch state.
+#if FNX_MALL_PF
+    void mall_pf_plan();
+    void mall_pf_fork(CardBuf& b, const CardW& w, const LayerW& L, int point);
+    void mall_pf_join(CardBuf& b);
+    void mall_pf_hc(CardBuf& b);
+    // FNX_MALL_PF_MODE=run (default): no fork in the graph. mall_pf_window, before a trunk window's graph launch: the persistent prefetcher on the
+    // side stream (run false: an eager window, only its events are counted). mall_pf_mark: the count word for a kernel of a trunk layer that is
+    // an event (PF_EV_*: the layer's first hc read, its second hc read, the router's start, the router's end), or null
+    enum { PF_EV_HC0 = 1, PF_EV_HC1 = 2, PF_EV_ROUTER = 4, PF_EV_MOE = 8 };
+    void mall_pf_window(CardBuf& b, bool run, int rows = MAXT);
+    unsigned* mall_pf_mark(CardBuf& b, const CardW& w, const LayerW& L, int events);
+    int pf_wg_ = 0, pf_at_ = 1, pf_mode_ = 1;   // pf_mode_: 1 run, 0 graph
+    int pf_events_ = 0, pf_nev_ = 1;            // run: the events of a layer (PF_EV_*), how many
+    int pf_gate_ = 0;                           // run: the gate's piece in bytes (PfRun::gate), 0: off
+    int pf_gate_rows_ = 0;                      // FNX_MALL_PF_GATE_ROWS: windows of this many rows and fewer run without the gate (0: every window has it)
+    bool pf_wrap_ = false, pf_hcjoin_ = false, pf_query_ = false;
+#else
+    void mall_pf_plan() {}
+    void mall_pf_fork(CardBuf&, const CardW&, const LayerW&, int) {}
+    void mall_pf_join(CardBuf&) {}
+    void mall_pf_hc(CardBuf&) {}
+    void mall_pf_window(CardBuf&, bool, int = 0) {}
+#endif
 #if FNX_27B
     // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
     // with the recurrent core each kind runs

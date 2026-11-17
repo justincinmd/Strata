@@ -134,6 +134,7 @@ private:
     void evict(size_t need);
     void park_live_();
     void checkpoint(Conv& c);
+    void read_windows_(const std::vector<int>& seg, int next);   // FNX_READ_WIN: a short segment through decode windows
     std::vector<int> prompt_;   // the prompt being answered (its last token not yet in the engine)
     GenStats* timing_ = nullptr;   // generate()'s stats while it runs
     bool is_eos(int t) const;

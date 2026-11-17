@@ -24,6 +24,9 @@ ggml=""; [ -z "$GG" ] || ggml="-DSTRATA_GGML_DIR=$GG"
 CARDS=${CARDS:-2 3 4}
 JOBS=${JOBS:-12}
 ARCHS=${ARCHS:-gfx1201;gfx1200;gfx11-generic}
+# FAST=1: the faster paths with the same output bits (-DSTRATA_SPLIT_FAST=ON; needs ARCHS=gfx1201). APPROX=1 with it: also the paths that change
+# the output's last bits (-DSTRATA_SPLIT_APPROX=ON; needs CARDS=4). docs/SPLIT_ENGINE.md "Faster paths on four R9700"
+fast=""; [ "${FAST:-0}" = 1 ] && fast="-DSTRATA_SPLIT_FAST=ON"; [ "${APPROX:-0}" = 1 ] && fast="$fast -DSTRATA_SPLIT_APPROX=ON"
 export HIP_PLATFORM=amd HIP_COMPILER=clang HIP_RUNTIME=rocclr ROCM_PATH=$HP HIP_PATH=$HP PATH=$HP/bin:$PATH
 SYSDEPS=""; [ -d "$HP/lib/rocm_sysdeps" ] && SYSDEPS=";$HP/lib/rocm_sysdeps"
 BC=$HP/lib/llvm/amdgcn/bitcode; [ -d "$BC" ] || BC=$HP/amdgcn/bitcode
@@ -32,7 +35,7 @@ cmake -G Ninja -S "$SRC" -B "$B" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=
   "-DSTRATA_SPLIT_CARDS=${CARDS// /;}" "-DCMAKE_HIP_ARCHITECTURES=gfx1201" "-DSTRATA_SPLIT_HIP_ARCHS=$ARCHS" -DSTRATA_PREFILL_MMQ=ON -DSTRATA_NATIVE_EXPERTS=ON $ggml \
   -DCMAKE_HIP_COMPILER="$HP/llvm/bin/clang++" -DCMAKE_HIP_COMPILER_ROCM_ROOT="$HP" "-DCMAKE_PREFIX_PATH=$HP;$LIBW$SYSDEPS" \
   "-DCMAKE_HIP_FLAGS=--rocm-path=$HP --rocm-device-lib-path=$BC" -DSTRATA_PORTABLE=ON \
-  "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags"
+  "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" $fast
 out=""
 for n in $CARDS; do
   ninja -j "$JOBS" -C "$B" "strata-split-$n"

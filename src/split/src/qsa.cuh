@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(256) k_idx_proj(const uint16_t* __restrict__ w
     float acc[T] = {};
 #pragma unroll 4
     for (int c = lane * 2; c < N; c += 64) {
-        const unsigned wv = *reinterpret_cast<const unsigned*>(w + c);
+        const unsigned wv = FNX_WLD2P(reinterpret_cast<const unsigned*>(w + c));
         const float w0 = bf16f((uint16_t) (wv & 0xffffu)), w1 = bf16f((uint16_t) (wv >> 16));
 #pragma unroll
         for (int t = 0; t < T; ++t) {
@@ -64,13 +64,16 @@ __device__ __forceinline__ float idx_norm_rope(float v, const float* w, int pos,
     return out;
 }
 
-// block (row t, part): part < 4: indexer query head `part` normed and rotated into q; part 4: the raw key into the ring
+// block (row t, part): part < 4: indexer query head `part` normed and rotated into q; part 4: the raw key into the ring.
+// lr (with tab and ring): row t is a lane's of its own, at that lane's position, rotary table and ring
 __global__ void __launch_bounds__(QSA_DIM) k_idx_prep(const float* __restrict__ y, const float* __restrict__ qn, __half* ring, int ring_rows,
-                                                      float* __restrict__ q, const int* pos0p, float eps, Rope base) {
-    const int t = blockIdx.x, part = blockIdx.y, i = threadIdx.x, p = *pos0p + t;
+                                                      float* __restrict__ q, const int* pos0p, float eps, Rope base, LaneRows lr) {
+    const int t = blockIdx.x, part = blockIdx.y, i = threadIdx.x, p = row_pos(lr, pos0p, t);
     __shared__ float sh[32];
     __shared__ float buf[QSA_DIM];
     const float* yt = y + (size_t) t * QSA_ROWS;
+    base = row_rope(base, lr, t);
+    if (lr.ring) ring = reinterpret_cast<__half*>(lr.ring[t]);
     if (part < QSA_HEADS) {
         q[(size_t) t * QSA_HEADS * QSA_DIM + part * QSA_DIM + i] =
             idx_norm_rope(yt[part * QSA_DIM + i], qn, p, eps, base, sh, buf);
@@ -82,9 +85,12 @@ __global__ void __launch_bounds__(QSA_DIM) k_idx_prep(const float* __restrict__ 
 // a row whose position completes a block pools it: the mean of the members' raw keys (f16), normed, rotated to the
 // first member, stored f16
 __global__ void __launch_bounds__(QSA_DIM) k_idx_pool(const __half* ring, int ring_rows, const float* __restrict__ kn, __half* pooled, KvPages g,
-                                                      const int* pos0p, float eps, Rope base) {
-    const int t = blockIdx.x, i = threadIdx.x, p = *pos0p + t;
+                                                      const int* pos0p, float eps, Rope base, LaneRows lr) {
+    const int t = blockIdx.x, i = threadIdx.x, p = row_pos(lr, pos0p, t);
     if ((p + 1) % QSA_POOL != 0) return;
+    base = row_rope(base, lr, t);
+    g = row_pages(g, lr, t);
+    if (lr.ring) ring = reinterpret_cast<const __half*>(lr.ring[t]);
     __shared__ float sh[32];
     __shared__ float buf[QSA_DIM];
     float v = 0.f;
@@ -210,7 +216,7 @@ __global__ void __launch_bounds__(256) k_idx_score_tc(const float* __restrict__ 
     }
 }
 
-// row t's attended positions on this card (block j owned by card kv_card(j)), as local indices kv_local_block(j) * 4 + p % 4, ascending,
+// row t's attended positions on this card (block j owned by card kv_card(j); by heads every block: kv_mine), as local indices kv_local_block(j) * 4 + p % 4, ascending,
 // into cells[t] (n_cells[t] of them), or n_cells[t] = -1 when every visible block is kept (dense). A block per row: a radix select of the QSA_TOP-th highest score (scores >= 0: their bits
 // order as unsigned), then the blocks above it and the first ties by index, in index order, then the tail.
 constexpr int QSA_SEL_THREADS = 1024;
@@ -309,7 +315,7 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
             const unsigned k = key[j];
             bool take = k > thr;
             if (k == thr) take = eq_before++ < (int) want;
-            own += take && kv_card(j) == card;
+            own += take && kv_mine(j, card);
         }
     }
     __syncthreads();
@@ -329,7 +335,7 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
             const unsigned k = key[j];
             bool take = k > thr;
             if (k == thr) take = eq_before++ < (int) want;
-            if (take && kv_card(j) == card) {
+            if (take && kv_mine(j, card)) {
 #pragma unroll
                 for (int m = 0; m < QSA_POOL; ++m) row[out * QSA_POOL + m] = kv_local_block(j) * QSA_POOL + m;
                 ++out;
@@ -339,7 +345,7 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
     if (tid == QSA_SEL_THREADS - 1) {   // the last chunk's thread: `out` is the card's selected-block count
         int n = out * QSA_POOL;
         const int jt = p / QSA_POOL;   // the tail's block (incomplete)
-        if (kv_card(jt) == card)
+        if (kv_mine(jt, card))
             for (int m = 0; m < n_tail; ++m) row[n++] = kv_local_block(jt) * QSA_POOL + (p - n_tail + 1 + m) % QSA_POOL;
         n_cells[t] = n;
     }

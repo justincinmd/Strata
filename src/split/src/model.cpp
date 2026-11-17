@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -624,6 +625,29 @@ struct Up {
         h.insert(h.end(), (const float*) t2.data, (const float*) t2.data + t2.ne[0] * t2.ne[1]);
         return put<float>(h.data(), h.size() * 4);
     }
+#if FNX_ROUTER_BF16
+    // FNX_ROUTER_BF16 (model.hpp): the router's table (a's values, then b's: whole rows of N) a second time as bf16 in k_router_route's order, when
+    // every value is a bf16 value and the switch is not 0; else null (the kernel then reads the f32 table) with one line the first time
+    uint16_t* router_bf(const float* a, size_t na, const float* b, size_t nb, const std::string& name) {
+        static const long long mode = env_int("FNX_ROUTER_BF16", 1);
+        static std::atomic<bool> said_on{false}, said_off{false};
+        if (mode == 0) return nullptr;
+        if ((na + nb) % N) throw std::runtime_error(name + ": the router's table is not whole rows of " + std::to_string(N));
+        if (!router_bf16_exact(a, na) || !router_bf16_exact(b, nb)) {
+            if (!said_off.exchange(true))
+                std::fprintf(stderr, "fnx: FNX_ROUTER_BF16: %s holds values that are not bf16 values; such a router keeps its f32 table\n", name.c_str());
+            return nullptr;
+        }
+        std::vector<float> h(a, a + na);
+        h.insert(h.end(), b, b + nb);
+        std::vector<uint16_t> o(h.size());
+        router_bf16_pack(h.data(), h.size() / N, o.data());
+        if (!said_on.exchange(true))
+            std::fprintf(stderr, "fnx: FNX_ROUTER_BF16=%lld: the routers' tables also as bf16 (every value exact; %.1f MB a layer more a card)\n", mode,
+                         o.size() * 2 / 1e6);
+        return put<uint16_t>(o.data(), o.size() * 2);
+    }
+#endif
     // per expert: every row, input blocks [b0, b1) (down), expert-major
     DW expert_cols(const Tensor& t, int b0, int b1, size_t& stride, const char** host_of = nullptr) {
         const TypeInfo ti = block32(t);
@@ -789,9 +813,18 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     return;
 #endif
     // the K/V cache is split by position: every card projects q for every head and k/v for both KV heads
+    // (FNX_ATT_HEADS: by heads, only its own query heads and their KV head: qrows, kvrows)
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
     for (int i = 0; i < NKVH * HD; ++i) kvrows_all.push_back(i);
+    if (ATT_HEADS) {
+        if ((int) qrows.size() != QG_W || (int) kvrows.size() != KV_W || c.kv0 != kv_head0(c.q0 / (NQH / NCARD)) || c.nkv != KVH_LOC)
+            throw std::runtime_error("fnx: by heads, card " + std::to_string(c.q0 / (NQH / NCARD)) + " has " + std::to_string(qrows.size()) + " q rows and " +
+                                     std::to_string(kvrows.size()) + " k/v rows (KV heads " + std::to_string(c.kv0) + " + " + std::to_string(c.nkv) +
+                                     "), not " + std::to_string(QG_W) + " and " + std::to_string(KV_W));
+        qrows_all = qrows;
+        kvrows_all = kvrows;
+    }
     c.L.resize(NL);
     std::vector<const char*> hgu(host_experts ? (size_t) NL * NEXP : 0), hdn(hgu.size());   // the experts' host copies
     for (int l = 0; l < NL; ++l) {
@@ -812,6 +845,9 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
                                      std::to_string(gs.ne[1]) + ", not the " + std::to_string(NEXP) +
                                      " gate rows and 1 shared row k_router_route reads");
         w.router = up.f32_cat(gi, gs, N);
+#if FNX_ROUTER_BF16
+        w.router_bf = up.router_bf((const float*) gi.data, (size_t) gi.ne[0] * gi.ne[1], (const float*) gs.data, (size_t) gs.ne[0] * gs.ne[1], gi.name);
+#endif
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
             w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
@@ -1062,9 +1098,18 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     for (int h = c.kv0; h < c.kv0 + c.nkv; ++h)
         for (int i = 0; i < HD; ++i) kvrows.push_back(h * HD + i);
     // the K/V cache is split by position: every card projects q for every head and k/v for both KV heads
+    // (FNX_ATT_HEADS: by heads, only its own query heads and their KV head: qrows, kvrows)
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
     for (int i = 0; i < NKVH * HD; ++i) kvrows_all.push_back(i);
+    if (ATT_HEADS) {
+        if ((int) qrows.size() != QG_W || (int) kvrows.size() != KV_W || c.kv0 != kv_head0(c.q0 / (NQH / NCARD)) || c.nkv != KVH_LOC)
+            throw std::runtime_error("fnx: by heads, card " + std::to_string(c.q0 / (NQH / NCARD)) + " has " + std::to_string(qrows.size()) + " q rows and " +
+                                     std::to_string(kvrows.size()) + " k/v rows (KV heads " + std::to_string(c.kv0) + " + " + std::to_string(c.nkv) +
+                                     "), not " + std::to_string(QG_W) + " and " + std::to_string(KV_W));
+        qrows_all = qrows;
+        kvrows_all = kvrows;
+    }
     LayerW& w = mc.L;
     const char* hp[2] = {"attn_hyper_connection.", "mlp_hyper_connection."};
     for (int h = 0; h < 2; ++h) {
@@ -1089,6 +1134,9 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
         const uint16_t* b = bf16_of(sg);
         for (size_t i = 0; i < (size_t) N; ++i) { const uint32_t u = (uint32_t) b[i] << 16; std::memcpy(&h[(size_t) NEXP * N + i], &u, 4); }
         w.router = up.put<float>(h.data(), h.size() * 4);
+#if FNX_ROUTER_BF16
+        w.router_bf = up.router_bf(h.data(), h.size(), nullptr, 0, "mtp: mlp.gate.weight");
+#endif
     }
     w.wq = up.dense(up.rows(f["self_attn.q_proj.weight"], qrows_all));
     w.wk = up.dense(up.rows(f["self_attn.k_proj.weight"], kvrows_all));
@@ -1606,6 +1654,9 @@ void card_ptrs(CardW& c, F f) {
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv);
     for (LayerW& w : c.L) {
         for (int h = 0; h < 2; ++h) f(w.hc_norm[h]), q8(w.hc_down[h]), q8(w.hc_up[h]), f(w.hc_inj[h]);
+#if FNX_ROUTER_BF16
+        f(w.router_bf);
+#endif
         f(w.router), dw(w.qkv), dw(w.z), dw(w.ssm_out), dw(w.qkvz), f(w.ab), f(w.conv), f(w.alpha), f(w.beta), f(w.ssm_a),
             f(w.dt_bias), f(w.ssm_norm);
         dw(w.wq), dw(w.wk), dw(w.wv), dw(w.wo), f(w.q_norm), f(w.k_norm), f(w.idx_wq), f(w.idx_wk), dw(w.idx_qk), f(w.idx_qn),
@@ -1616,7 +1667,7 @@ void card_ptrs(CardW& c, F f) {
     for (const char*& p : c.ec_host_dn) f(p);
 }
 #if !FNX_27B
-static_assert(sizeof(LayerW) == 952, "LayerW changed: put its new addresses in card_ptrs, then update this size");
+static_assert(sizeof(LayerW) == (FNX_ROUTER_BF16 ? 960 : 952), "LayerW changed: put its new addresses in card_ptrs, then update this size");
 #endif
 }  // namespace
 

@@ -32,6 +32,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <set>
@@ -44,6 +45,7 @@
 #include "../src/batch.hpp"
 #include "../src/engine.hpp"
 #include "../src/env.hpp"
+#include "../src/hip/queue_budget.hpp"
 #include "../src/session.hpp"
 #include "sfnx_input.hpp"
 
@@ -123,6 +125,9 @@ struct GenReq {
     fnx::ReadHints hints;
     std::vector<int> ids;
     std::vector<float> img_rows;   // every image's rows, in prompt order (hints.images point into it)
+    long long arrived_ns = 0;      // FNX_REQ_TIMING: when the reader had the whole line (steady clock), its size, and the parse's time
+    size_t line_bytes = 0;
+    double parse_ms = 0.0;
     GenReq() = default;
     GenReq(GenReq&&) = default;   // a vector's move keeps its buffer, so hints.images stay valid
     GenReq& operator=(GenReq&&) = default;
@@ -229,7 +234,17 @@ std::vector<std::string> split_commas(const std::string& s) {
 }
 
 GenReq parse_gen(const std::string& line, int vocab, int pad, bool batch, bool images) {
-    std::istringstream is(line);
+    // the token ids are the line's last field and nearly all of it (665 KB at 104K tokens). Read through the string stream, a copy
+    // of the word and a string an id they took 5.2 ms; scanned in the line they take 0.9 ms (`tail_ids`). The fields before them are read as
+    // before, from the line without its last field. Only a line whose last field can be the ids goes this way (no '=' in it, and the command's
+    // own fields before it); every other line is read whole as before, so each error stays what it was
+    const auto space = [](char ch) { return ch == ' ' || (ch >= '\t' && ch <= '\r'); };
+    size_t end = line.size(), tail = 0, head_fields = 0;
+    while (end > 0 && space(line[end - 1])) --end;
+    for (tail = end; tail > 0 && !space(line[tail - 1]);) --tail;
+    for (size_t i = 0; i < tail; ++i) head_fields += !space(line[i]) && (i == 0 || space(line[i - 1]));
+    const bool tail_ids = tail < end && head_fields >= (batch ? 3u : 2u) && std::memchr(line.data() + tail, '=', end - tail) == nullptr;
+    std::istringstream is(tail_ids ? line.substr(0, tail) : line);
     std::string cmd, word;
     GenReq r;
     is >> cmd;
@@ -291,18 +306,45 @@ GenReq parse_gen(const std::string& line, int vocab, int pad, bool batch, bool i
         }
         else throw std::runtime_error(cmd + ": unknown key " + k);
     }
-    if (is >> word) throw std::runtime_error(cmd + ": text after the token ids");
-    if (ids.empty()) throw std::runtime_error(cmd + ": no token ids");
+    // the last field, as the loop above takes a word without '=': text after ids already found, else the embeddings file, else the ids
+    bool scan = false;
+    if (tail_ids) {
+        if (!ids.empty()) throw std::runtime_error(cmd + ": text after the token ids");
+        if (images && emb_path.empty()) emb_path = line.substr(tail, end - tail);
+        else scan = true;
+    } else if (is >> word) throw std::runtime_error(cmd + ": text after the token ids");
+    if (ids.empty() && !scan) throw std::runtime_error(cmd + ": no token ids");
     try {
         fnx::check_sampling(r.s);
     } catch (const std::runtime_error& ex) {
         throw std::runtime_error(cmd + ": " + ex.what());
     }
-    for (const std::string& t : split_commas(ids)) {
+    const auto token = [&](const std::string& t) {
         long long v = 0;
         if (!fnx::parse_whole(t.c_str(), v)) throw std::runtime_error(cmd + ": token id '" + t + "' is not a whole number");
         if (v < 0 || v >= vocab) throw std::runtime_error(cmd + ": token id " + t + " outside the vocabulary");
         r.ids.push_back((int) v);
+    };
+    if (scan) {
+        const char* p = line.data() + tail;
+        const char* const e = line.data() + end;
+        r.ids.reserve((size_t) (e - p) / 2 + 1);
+        for (;;) {   // as split_commas: n commas are n + 1 tokens, empty ones too
+            const char* q = p;
+            long long v = 0;
+            while (q < e && q - p < 10 && *q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+            if (q > p && q - p < 10 && (q == e || *q == ',')) {   // 1 to 9 digits: the value parse_whole gives
+                if (v >= vocab) throw std::runtime_error(cmd + ": token id " + std::string(p, q) + " outside the vocabulary");
+                r.ids.push_back((int) v);
+            } else {   // anything else as before: a sign, 10 digits and more, an empty token, other characters
+                while (q < e && *q != ',') ++q;
+                token(std::string(p, q));
+            }
+            if (q == e) break;
+            p = q + 1;
+        }
+    } else {
+        for (const std::string& t : split_commas(ids)) token(t);
     }
     if (images) attach_images(r, emb_path, img_keys, pad);
     // SFNX_TEST_PROMPT=FILE.bin with SFNX_TEST_PROMPT_CONFIRM=1 (measurements only; check_test_prompt at start): a text
@@ -538,6 +580,12 @@ struct Server {
         return wrote;
     }
     void save_routes() {
+        // FNX_PREFETCH_PROBE's totals (how well layer l's FFN input through layer l + 1's router guesses layer l + 1's experts)
+        if (const std::vector<unsigned long long> pc = e.probe_counts(); !pc.empty() && pc[3] > 0 && pc[0] > 0 && pc[1] > 0)
+            std::fprintf(stderr, "sfnx: prefetch probe: %llu layer-windows, distinct experts a layer-window: picked %.2f, guessed %.2f, both %.2f "
+                         "(%.1f%% of the picked guessed, %.1f%% of the guessed not picked)\n",
+                         pc[3], (double) pc[0] / pc[3], (double) pc[1] / pc[3], (double) pc[2] / pc[3], 100.0 * pc[2] / pc[0],
+                         100.0 * (pc[1] - pc[2]) / pc[1]);
         if (!trace_failed)
             if (const std::vector<unsigned> t = e.route_trace(traced); !t.empty()) {
                 const char* tpath = std::getenv("FNX_ROUTE_TRACE_FILE");
@@ -665,6 +713,7 @@ struct Server {
             static const bool wstats = fnx::env_flag("FNX_BATCH_STATS");
             static std::chrono::steady_clock::time_point t_prev_end{};
             static double acc_out = 0, acc_win = 0, acc_ver = 0, acc_dr = 0, acc_say = 0;
+            static double acc_call = 0, acc_gpu = 0, acc_calls = 0, acc_rows = 0;
             static int nwin = 0;
             const auto tw0 = std::chrono::steady_clock::now();
             if (wstats && t_prev_end.time_since_epoch().count() != 0) {
@@ -680,9 +729,13 @@ struct Server {
                 acc_win += std::chrono::duration<double, std::milli>(t_prev_end - tw0).count();
                 acc_ver += dec->last_verify_ms;
                 acc_dr += dec->last_draft_ms;
+                acc_call += dec->last_call_ms, acc_gpu += dec->last_call_gpu_ms, acc_calls += dec->last_calls, acc_rows += dec->last_rows;
                 if (++nwin == 100) {
                     std::fprintf(stderr, "fnx: window cycle (100 windows, means in ms): between windows %.1f, window() %.1f = verify_rows %.1f + draft_next %.1f + the rest %.1f\n", acc_out / nwin,
                                  acc_win / nwin, acc_ver / nwin, acc_dr / nwin, (acc_win - acc_ver - acc_dr) / nwin);
+                    std::fprintf(stderr, "fnx: window cycle: %.1f rows a window; draft_next = %.2f draft-layer calls, %.2f ms in them (the cards' own %.2f) + %.2f ms outside them\n",
+                                 acc_rows / nwin, acc_calls / nwin, acc_call / nwin, acc_gpu / nwin, (acc_dr - acc_call) / nwin);
+                    acc_call = acc_gpu = acc_calls = acc_rows = 0;
                     acc_out = acc_win = acc_ver = acc_dr = acc_say = 0;
                     nwin = 0;
                 }
@@ -802,6 +855,7 @@ struct Server {
     void solo(const GenReq& r) {
         const Running running(in, r.seq);
         yield_said = false;
+        const auto t_solo = std::chrono::steady_clock::now();
         int slot = best_slot(r.ids, 0);
         if (slot < 0) {   // the front end sends GEN only when no slot decodes
             say("ERR GEN: every slot is decoding");
@@ -819,11 +873,24 @@ struct Server {
             return;
         }
         fnx::GenStats st;
+        // FNX_REQ_TIMING=1: a request's way from its line to its read. The arrival is on the steady clock (CLOCK_MONOTONIC: a client's
+        // time.monotonic_ns() on this machine compares with it)
+        static const bool req_timing = fnx::env_flag("FNX_REQ_TIMING");
+        const auto steady_ns = [] { return (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+        long long read0_ns = 0, read1_ns = 0, first_ns = 0;   // FNX_REQ_TIMING: the read's start and end, the first token's line written
+        if (req_timing) {
+            const auto now = std::chrono::steady_clock::now();
+            const long long now_ns = read0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+            const double room_ms = std::chrono::duration<double, std::milli>(now - t_solo).count();
+            std::fprintf(stderr, "sfnx: request timing: line of %zu bytes (%zu ids) complete at %lld ns; to the read's start %.2f ms (parse %.2f, slot and room %.2f)\n",
+                         r.line_bytes, r.ids.size(), r.arrived_ns, (double) (now_ns - r.arrived_ns) / 1e6, r.parse_ms, room_ms);
+        }
         try {
             reading = slot;
             e.set_pass_rows(any_decoding() ? 8192 : 0);   // other requests decode: they run between passes, so a pass stays at most 8192 rows (what 2 chunks of 4096 were)
             s.read(r.ids, st, progress(-1, r.seq), r.hints);
             reading = -1;
+            if (req_timing) read1_ns = steady_ns();
         } catch (const Interrupted& it) {
             reading = -1;
             st.prompt_tokens = it.read;   // as far as the read got (st.reused of them reused), not the whole prompt
@@ -853,13 +920,28 @@ struct Server {
             ~PoolShort() { e.on_pool_short = nullptr; }
         } pool_short{e};
         e.on_pool_short = [this, slot](int, int pages) { make_room(e.free_pages() + pages, slot); };
-        const fnx::Finish f = s.generate(r.max_new, r.s, [&](int t) { say("T " + std::to_string(t)); }, &in.stop_now, st);
+        const fnx::Finish f = s.generate(r.max_new, r.s, [&](int t) {
+            say("T " + std::to_string(t));
+            if (req_timing && first_ns == 0) first_ns = steady_ns();
+        }, &in.stop_now, st);
         done_line(st, f);
+        if (req_timing)   // the second line of a request: the read's wall time against its own count, and the way from its end to the first token's line
+            std::fprintf(stderr, "sfnx: request timing: the read %.2f ms wall (its count %.2f); from its end to the first token's line %.2f ms, written at %lld ns\n",
+                         (double) (read1_ns - read0_ns) / 1e6, st.prompt_ms, first_ns ? (double) (first_ns - read1_ns) / 1e6 : -1.0, first_ns);
         std::fprintf(stderr, "sfnx: slot %d: prompt %d tokens = %d reused + %d read in %.0f ms, %d generated in %.0f ms (%.1f tok/s), "
                              "drafts %ld of %ld, %d rounds (%d with lookup drafts, %.2f ms a round)\n",
                      slot, st.prompt_tokens, st.reused, st.prompt_tokens - st.reused, st.prompt_ms, st.generated, st.decode_ms,
                      st.generated * 1000.0 / std::max(1.0, st.decode_ms), st.drafts_accepted, st.drafts_offered, st.rounds, st.lookup_rounds,
                      st.decode_ms / std::max(1, st.rounds));
+        // FNX_SOLO_STATS=1, where a one-user round's time goes (means per round, ms)
+        if (static const bool solo_stats = fnx::env_int("FNX_SOLO_STATS", 0) != 0; solo_stats && st.rounds > 0) {
+            const double r = st.rounds;
+            std::fprintf(stderr, "sfnx: solo stats: %.2f rows a round, %.2f tokens a round; ms a round: verify %.2f (gpu %.2f, launch %.2f), drafts %.2f "
+                                 "(gpu %.2f, %.2f calls, %.3f a call), commit %.2f, other %.2f\n",
+                         1.0 + st.drafts_offered / r, st.generated / r, st.verify_ms / r, st.verify_gpu_ms / r, st.launch_ms / r, st.draft_ms / r,
+                         st.draft_gpu_ms / r, st.draft_calls / r, st.draft_ms / std::max(1, st.draft_calls), st.commit_ms / r,
+                         (st.decode_ms - st.verify_ms - st.draft_ms - st.commit_ms) / r);
+        }
         slots[(size_t) slot].idle_since = std::chrono::steady_clock::now();
         save_routes();
     }
@@ -905,11 +987,27 @@ struct Server {
             }
             decode_step();
         }
+        // FNX_TF_TAIL=n with FNX_DUMP_FIRST_LOGITS=PATH (diagnostics; for requests of one token): the prompt's last n tokens go through one-row windows
+        // behind the read instead of through the prompt path, and each of those steps is scored against the token that follows it (teacher forcing).
+        // PATH.t<k> (k as PATH.b<k>): int32 {steps, 64, prompt tokens}, then a step: the next token, the log of the sum of the logits' exponentials,
+        // the next token's logit, the 64 largest logits (id, value). It measures what a change of the prompt path's arithmetic does to the positions
+        // behind a read. The read leaves no checkpoints. The draft layer does not read the forced rows, so such a request ends after its first token
+        // and its lane is cleared (nothing may go on from it).
+        static const int tf_tail = (int) std::min<long long>(std::max<long long>(fnx::env_int("FNX_TF_TAIL", 0), 0), 1 << 20);
+        static const char* const tf_dump = std::getenv("FNX_DUMP_FIRST_LOGITS");
+        static int dump_n = 0;   // the admission's number in PATH.b<n> / PATH.t<n>
+        const int n_tf = tf_tail > 0 && tf_dump && r.ids.size() >= (size_t) tf_tail + 64 ? tf_tail : 0;
         fnx::GenStats st;
         try {
             reading = i;
             e.set_pass_rows(any_decoding() ? 8192 : 0);
-            s.read(r.ids, st, progress(i, r.seq), r.hints);
+            if (n_tf) {
+                fnx::ReadHints h = r.hints;
+                h.cache = false;
+                s.read(std::vector<int>(r.ids.begin(), r.ids.end() - n_tf), st, progress(i, r.seq), h);
+            } else {
+                s.read(r.ids, st, progress(i, r.seq), r.hints);
+            }
             reading = -1;
         } catch (const Interrupted& it) {
             reading = -1;
@@ -929,9 +1027,50 @@ struct Server {
             sl.idle_since = std::chrono::steady_clock::now();
             return;
         }
+        if (n_tf) {   // the forced tail: tokens L-n-1 .. L-2, each scored against the next
+            const std::string path = std::string(tf_dump) + ".t" + std::to_string(dump_n);
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            const int32_t hdr[3] = {n_tf, 64, (int32_t) r.ids.size()};
+            bool ok = f && std::fwrite(hdr, 4, 3, f) == 3;
+            std::vector<int> idx;
+            const auto t_tf = std::chrono::steady_clock::now();
+            for (size_t q = r.ids.size() - (size_t) n_tf - 1; q + 1 < r.ids.size(); ++q) {   // (every step runs, written or not: the prompt must be whole)
+                e.step({sl.lane}, {r.ids[q]});
+                if (!ok) continue;
+                const std::vector<float> row = e.last_logits(1);
+                const int32_t next = r.ids[q + 1];
+                float mx = -INFINITY;
+                for (float v : row) mx = std::max(mx, v);
+                double sum = 0;
+                for (float v : row) sum += std::exp((double) v - mx);
+                const float rec[2] = {(float) (mx + std::log(sum)), next >= 0 && (size_t) next < row.size() ? row[(size_t) next] : NAN};
+                idx.resize(row.size());
+                std::iota(idx.begin(), idx.end(), 0);
+                std::partial_sort(idx.begin(), idx.begin() + 64, idx.end(), [&](int a, int b) { return row[(size_t) a] > row[(size_t) b] || (row[(size_t) a] == row[(size_t) b] && a < b); });
+                ok = std::fwrite(&next, 4, 1, f) == 1 && std::fwrite(rec, 4, 2, f) == 2;
+                for (int k = 0; ok && k < 64; ++k) {
+                    const int32_t id = idx[(size_t) k];
+                    ok = std::fwrite(&id, 4, 1, f) == 1 && std::fwrite(&row[(size_t) id], 4, 1, f) == 1;
+                }
+            }
+            if (f && std::fclose(f) != 0) ok = false;
+            if (!ok) std::fprintf(stderr, "sfnx: FNX_TF_TAIL: cannot write %s\n", path.c_str());
+            st.prompt_tokens = (int) r.ids.size();   // the whole prompt is in the lane; the forced steps are part of its read
+            st.prompt_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tf).count();
+        }
         // the first token: the prompt's last through a window of this lane alone
         const auto t1 = std::chrono::steady_clock::now();
         const std::vector<int> o = e.step({sl.lane}, {r.ids.back()});
+        {   // FNX_DUMP_FIRST_LOGITS=PATH (diagnostics, as Session's): the whole vocabulary's logits of each admission's first token to PATH.b<n> (float32; Session's files are PATH.<n>)
+            static const char* const dump = std::getenv("FNX_DUMP_FIRST_LOGITS");
+            if (dump) {
+                const std::vector<float> row = e.last_logits(1);
+                const std::string path = std::string(dump) + ".b" + std::to_string(dump_n++);
+                std::FILE* f = std::fopen(path.c_str(), "wb");
+                if (!f || std::fwrite(row.data(), 4, row.size(), f) != row.size()) std::fprintf(stderr, "sfnx: FNX_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
+                if (f) std::fclose(f);
+            }
+        }
         sl.s = r.s;
         sl.rng.seed(r.s.seed ? *r.s.seed : std::random_device{}());
         sl.recent = tail(r.ids, std::max(1, r.s.pen_last_n));
@@ -944,9 +1083,13 @@ struct Server {
         say("T " + std::to_string(tok));
         st.generated = 1;
         st.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
-        const bool more = !is_eos(tok) && r.max_new > 1;
+        const bool more = !is_eos(tok) && r.max_new > 1 && !n_tf;
         done_line(st, is_eos(tok) ? fnx::Finish::stop : fnx::Finish::length);
         say("BADM " + std::to_string(i) + (more ? " 1" : " 0"));
+        if (n_tf) {   // (the draft layer has not read the forced rows)
+            e.use_lane(sl.lane);
+            e.reset();
+        }
         if (!more) {
             sl.idle_since = std::chrono::steady_clock::now();
             return;
@@ -998,9 +1141,12 @@ struct Server {
             }
             GenReq r;
             try {
+                const auto t_parse = std::chrono::steady_clock::now();
                 r = parse_gen(line, m.vocab, (int) m.ple_image, batch, images);
                 if ((long) r.ids.size() + r.max_new + 8 > a.max_ctx) throw std::runtime_error(cmd + ": prompt + max_new exceed the context");
                 r.seq = seq;
+                r.arrived_ns = in.taken_ns, r.line_bytes = line.size();
+                r.parse_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_parse).count();
             } catch (const std::exception& ex) {
                 say(std::string("ERR ") + ex.what());
                 continue;
@@ -1101,6 +1247,11 @@ void load_dflash2(fnx::df2::Bridge& br, const fnx::Model& m, const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if FNX_HIP
+    // before the first HIP call: the runtime's compute queues a card stay inside the card's hardware slots (src/hip/queue_budget.hpp)
+    const fnx::QueueBudget qb = fnx::queue_budget_apply("/sys/class/kfd/kfd", fnx::FAST);   // (a default build leaves the runtime's own number)
+    if (!qb.line.empty()) std::fprintf(stderr, "sfnx: %s\n", qb.line.c_str());
+#endif
     Args a;
     try {
         a = parse_args(argc, argv);
@@ -1145,13 +1296,23 @@ int main(int argc, char** argv) {
 #else
                      fnx::kv_q8() ? "int8" : "f16", e->free_pages() * fnx::KVP_POS, vfree.c_str());
 #endif
+#if FNX_HIP
+        // (queues are made as streams are first used: the count after the first request is the run's)
+        if (const std::string ql = fnx::queue_count_line("/sys/class/kfd/kfd", (long) getpid()); !ql.empty())
+            std::fprintf(stderr, "sfnx: compute queues / hardware slots at load: %s; GPU_MAX_HW_QUEUES=%d\n", ql.c_str(), qb.value);
+#endif
         if (fnx::NCARD > 3)
             std::fprintf(stderr, "sfnx: %d cards builds and passes the CPU checks but has not been validated on hardware "
                                  "(docs/verification.md, \"Other card counts\")\n", fnx::NCARD);
         say("INFO engine=sfnx version=0.2 spec=" + std::to_string(a.K) + " conversation_cache_mib=" + std::to_string(a.cache_mib) +
             (a.batch > 1 ? " batch_slots=" + std::to_string(a.batch) + " slot_cache=1" : ""));
         say("READY " + std::to_string(a.max_ctx) + " stop");
-        std::thread reader([&] { in.run(); });
+        // FNX_STDIN_GETLINE=1: the lines through std::getline on std::cin, as before (sfnx_input.hpp run_fd)
+        in.stamp = fnx::env_flag("FNX_REQ_TIMING");
+        std::thread reader([&] {
+            if (fnx::env_int("FNX_STDIN_GETLINE", 0) != 0) in.run();
+            else in.run_fd(0);
+        });
         reader.detach();
         try {
             srv.run();

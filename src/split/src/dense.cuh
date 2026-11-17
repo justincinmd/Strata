@@ -58,8 +58,8 @@ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, c
             float dw[Q8S_R];
 #pragma unroll
             for (int r = 0; r < Q8S_R; ++r) {
-                w[r] = __ldg(reinterpret_cast<const int4*>(wq(r) + c));
-                dw[r] = __half2float(__ushort_as_half(__ldg(wd(r) + b)));
+                w[r] = FNX_WLD2(reinterpret_cast<const int4*>(wq(r) + c));
+                dw[r] = __half2float(__ushort_as_half(FNX_WLD2(wd(r) + b)));
             }
 #pragma unroll
             for (int t0 = 0; t0 < T; t0 += TC) {
@@ -125,8 +125,8 @@ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, c
 #pragma unroll
         for (int r = 0; r < Q8S_R; ++r) {
             if (row0 + r >= rows) break;
-            const int4 w = __ldg(reinterpret_cast<const int4*>(wq(r) + c));
-            const float dw = __half2float(__ushort_as_half(__ldg(wd(r) + b)));
+            const int4 w = FNX_WLD2(reinterpret_cast<const int4*>(wq(r) + c));
+            const float dw = __half2float(__ushort_as_half(FNX_WLD2(wd(r) + b)));
 #pragma unroll
             for (int t = 0; t < T; ++t) {
                 int s = __dp4a(w.x, a[t][0], 0);
@@ -158,6 +158,92 @@ __global__ void __launch_bounds__(Q8S_THREADS) k_q8s(const Q8Segs g, int rows, i
                                                     const int8_t* __restrict__ tq, const float* __restrict__ td) {
     q8s_block<T, Q8S_R, SPLIT, SEG>(g, rows, cols, y, tq, td, blockIdx.x);
 }
+
+#if FNX_MM && FNX_HIP
+// ---------------------------------------------------------------- the same product on the int8 matrix instruction (mm.cuh)
+// A block is 16 weight rows (lane l: row l & 15 of them, in both operands' halves) and Q8S_THREADS / 32 = 8 waves, each a share of the columns: wave w
+// the 32-column blocks w, w + 8, w + 16, ... of the rows. A unit (16 rows x 32 columns x up to 16 tokens) is two instructions whatever the window's size:
+// the window rides in the matrix (tokens 0..7 end in lanes 0..15, tokens 8..15 in lanes 16..31; a window of 8 rows or fewer leaves the upper lanes' sums
+// unread). Per unit and token register: one convert, one product of the scales, one fma. The weights' loads of MM_U units are issued together (the
+// stream's loads: non-temporal at FNX_MALL_NT 2), then the units run.
+// The sum of (row r, token t), in this order whatever the grid or the timing:
+//   wave w:  p_w = 0; for b = w, w + 8, ... (ascending): p_w = fma(dw[r][b] * da[t][b], (float) S_b, p_w), S_b the block's exact integer dot
+//   out = ((p_0 + p_1) + (p_2 + p_3)) + ((p_4 + p_5) + (p_6 + p_7))
+// The dp4a kernels (q8s_block) convert every 16 columns and add in another order: the two differ in the last bits (same integers, same scales).
+constexpr int MM_W = Q8S_THREADS / 32, MM_U = 6;
+
+template <int T, bool SPLIT, bool SEG>
+__device__ __forceinline__ void q8s_mm_block(const Q8Segs& g, int rows, int cols, const block_q8_1* __restrict__ y, const int8_t* __restrict__ tq,
+                                             const float* __restrict__ td, int bx) {
+    static_assert(T >= 1 && T <= 16, "the window rides in the matrix: 16 tokens at most");
+    constexpr int NR = T < 8 ? T : 8;   // token registers in use: token 8 (lane >> 4) + v
+    __shared__ float red[MM_W][T][16];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = lane & 15, h = lane >> 4, nb = cols / 32;
+    // the lane's weight row (past the last row: the last one again, not stored) and its token as an operand
+    const int row = min(bx * 16 + j, rows - 1), s = SEG ? q8s_seg(g, row) : 0, lr = row - (SEG ? q8s_pick(s, 0, g.end[0], g.end[1]) : 0);
+    const int8_t* const wq = (SEG ? q8s_pick(s, g.q[0], g.q[1], g.q[2]) : g.q[0]) + (size_t) lr * cols + 16 * h;
+    const uint16_t* const wd = (SEG ? q8s_pick(s, g.d[0], g.d[1], g.d[2]) : g.d[0]) + (size_t) lr * nb;
+    const int ta = min(j, T - 1);
+    float acc[NR];
+#pragma unroll
+    for (int v = 0; v < NR; ++v) acc[v] = 0.f;
+#pragma unroll 1
+    for (int b0 = warp; b0 < nb; b0 += MM_W * MM_U) {
+        uint4 w[MM_U];
+        float dw[MM_U];
+#pragma unroll
+        for (int u = 0; u < MM_U; ++u) {
+            const int b = b0 + u * MM_W;
+            if (b < nb) {   // (the same for the whole wave)
+                w[u] = FNX_WLD2(reinterpret_cast<const uint4*>(wq + (size_t) b * 32));
+                dw[u] = f16(FNX_WLD2(wd + b));
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < MM_U; ++u) {
+            const int b = b0 + u * MM_W;
+            if (b < nb) {
+                uint4 av;
+                float da[NR];
+                if constexpr (SPLIT) {
+                    av = *reinterpret_cast<const uint4*>(tq + (size_t) ta * cols + b * 32 + 16 * h);
+#pragma unroll
+                    for (int v = 0; v < NR; ++v) da[v] = td[(size_t) min(8 * h + v, T - 1) * nb + b];
+                } else {
+                    const unsigned* qs = reinterpret_cast<const unsigned*>(y[(size_t) ta * nb + b].qs) + 4 * h;
+                    av.x = qs[0], av.y = qs[1], av.z = qs[2], av.w = qs[3];
+#pragma unroll
+                    for (int v = 0; v < NR; ++v) da[v] = __low2float(y[(size_t) min(8 * h + v, T - 1) * nb + b].ds);
+                }
+                const fnx_mm::v8i c = fnx_mm::unit(w[u], av);
+#pragma unroll
+                for (int v = 0; v < NR; ++v) acc[v] = fmaf(dw[u] * da[v], (float) c[v], acc[v]);
+                fnx_mm::seq();
+            }
+        }
+    }
+#pragma unroll
+    for (int v = 0; v < NR; ++v)
+        if (8 * h + v < T) red[warp][8 * h + v][j] = acc[v];
+    __syncthreads();
+    // thread e: token e >> 4, row e & 15 of the block (a store per value, 16 rows side by side)
+    const int t = threadIdx.x >> 4, orow = bx * 16 + (threadIdx.x & 15);
+    if (t < T && orow < rows) {
+        const int jj = threadIdx.x & 15;
+        const float v = ((red[0][t][jj] + red[1][t][jj]) + (red[2][t][jj] + red[3][t][jj])) + ((red[4][t][jj] + red[5][t][jj]) + (red[6][t][jj] + red[7][t][jj]));
+        const int so = SEG ? q8s_seg(g, orow) : 0;
+        q8s_pick(so, g.out[0], g.out[1], g.out[2])[(size_t) t * q8s_pick(so, g.stride[0], g.stride[1], g.stride[2]) + orow -
+                                                   q8s_pick(so, 0, g.end[0], g.end[1])] = v;
+    }
+}
+static_assert(MM_W == 8 && Q8S_THREADS == 256, "q8s_mm_block: 8 waves' partial sums, a thread per (token, row)");
+
+template <int T, bool SPLIT, bool SEG>
+__global__ void __launch_bounds__(Q8S_THREADS) k_q8s_mm(const Q8Segs g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                                       const int8_t* __restrict__ tq, const float* __restrict__ td) {
+    q8s_mm_block<T, SPLIT, SEG>(g, rows, cols, y, tq, td, blockIdx.x);
+}
+#endif
 
 // The shared expert inside the routed experts' launches (no second stream): its gate|up as extra blocks of the router's
 // launch, its swiglu and down as an extra row of blocks of the routed down's. Both matrices have fewer than 4096 rows:

@@ -47,7 +47,32 @@ struct HcArgs {
     block_q8_1* q8;      // mixed as q8_1 too, or null
     int8_t* tq = nullptr;   // and its split twin, or null
     float* td = nullptr;
+    long long timeout = 2000000000LL;   // cycles a barrier waits before it sets err bit 4 (the residency probe of a grid waits less)
+#if FNX_KBENCH
+    int stub = 0;           // kbench only: parts of the read left out, to time the rest (the results are then wrong)
+#endif
+#if FNX_MALL_PF
+    unsigned* pf = nullptr;   // the persistent cache prefetcher's count (PfRun words[0]), or null: this read is an event
+#endif
 };
+// the read's event for the persistent prefetcher (k_mall_pf_run): one more, by one thread at the read's start (device scope, as
+// the prefetcher's loads of the count)
+#if FNX_MALL_PF
+#define HC_PF_EVENT(a) \
+    do { \
+        if ((a).pf && blockIdx.x == 0 && threadIdx.x == 0) atomicAdd((a).pf, 1u); \
+    } while (0)
+#else
+#define HC_PF_EVENT(a) \
+    do { \
+    } while (0)
+#endif
+// kbench's stubs: 1 the down dots, 2 the up dots, 4 the grid barriers, 8 the slice's quantization, 16 the reduction, 32 the up part's last loops
+#if FNX_KBENCH
+#define HC_STUB(b) ((a.stub & (b)) != 0)
+#else
+#define HC_STUB(b) false
+#endif
 
 __device__ __forceinline__ float rprime(const HcArgs& a, int t, int c, int i) {
     float r = a.R[(size_t) t * D + c * N + i];
@@ -70,17 +95,20 @@ __device__ __forceinline__ void q8_block(float v, int8_t* q, float* d) {
 // hc_bar_mod(g)). The block's last thread arrives and waits until the counter has left its barrier's generation: it is
 // then 1 to 2 * g - 1 past the generation's start, as no block can pass the next barrier before this one does. A fence
 // waits for the thread's own loads too, and that thread loads no up weights
-__device__ __forceinline__ void grid_sync(unsigned* bar, unsigned* err, unsigned g) {
+__device__ __forceinline__ void grid_sync(unsigned* bar, unsigned* err, unsigned g, long long timeout) {
     __syncthreads();
     if (threadIdx.x == blockDim.x - 1) {
         __threadfence();
         const unsigned mod = hc_bar_mod(g);
         const unsigned old = atomicInc(bar, mod - 1u), base = old - old % g;
-        const long long t0 = clock64();
+        const long long ts = clock64();
+        long long t0 = ts;
         for (;;) {
             const unsigned cur = *(volatile unsigned*) bar;
             if ((cur >= base ? cur - base : cur + (mod - base)) >= g) break;
-            if (clock64() - t0 > 2000000000LL) {
+            if (const long long dt = clock64() - t0; __builtin_expect(dt > timeout, 0)) {
+                if (diag_wait_on(err, dt, timeout, ts, t0)) continue;   // the driver had the queues off the cards
+                diag_timeout(err, DK_HC_BARRIER, base, cur, g, DG_NO_SRC, (unsigned) blockIdx.x, dt);
                 atomicOr(err, 4u);
                 break;
             }
@@ -116,10 +144,14 @@ template <int T> struct HcUp {
 template <int T, bool ONE, bool WALK>
 __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
     static_assert(sizeof(HcUp<T>) <= sizeof(float) * T * H_SL && LR % 16 == 0, "the up part's arrays inside xs, aligned");
+    HC_PF_EVENT(a);
     __shared__ __align__(16) float xs[T][H_SL];
     __shared__ __align__(16) int8_t xq[T][H_SL];
     __shared__ float xd[T][H_SL / 32];
     __shared__ float red[T][H_DT / 32];
+    // the inject rows' bf16 weights of the one warp that takes them (HC rows x H_TPRD lanes, NQ loads of 16 bytes each), kept in shared
+    // memory through its dots instead of in registers (see there)
+    __shared__ uint4 hu[HC * H_TPRD][H_SL / 8 / H_TPRD];
     HcUp<T>& up = *reinterpret_cast<HcUp<T>*>(&xs[0][0]);
     auto& lq = up.lq;
     auto& ld = up.ld;
@@ -160,12 +192,13 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
         for (int w = 0; w < H_DT / 32; ++w) v += red[t][w];
         a.ssp[(size_t) t * H_NS + s] = v;
     }
+    if (!HC_STUB(8))
     for (int q = warp; q < T * (H_SL / 32); q += H_DT / 32) {
         const int k = q / (H_SL / 32), blk = q % (H_SL / 32);
         q8_block(xs[k][blk * 32 + lane], &xq[k][blk * 32], &xd[k][blk]);
     }
     __syncthreads();
-    {
+    if (!HC_STUB(1)) {
         constexpr int NQ = H_SL / 8 / H_TPRD;
         const int j = t % H_TPRD, row = grp * H_RPG + t / H_TPRD;
         const int nrows = a.w_inj ? H_ROWS : LR;
@@ -180,8 +213,8 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
             float sc[NQ];
 #pragma unroll
             for (int q = 0; q < NQ; ++q) {
-                u[q] = __ldg(w2 + q * H_TPRD + j);
-                sc[q] = f16(__ldg(wd + (q * H_TPRD + j) / 4));
+                u[q] = FNX_WLD2(w2 + q * H_TPRD + j);
+                sc[q] = f16(FNX_WLD2(wd + (q * H_TPRD + j) / 4));
             }
 #pragma unroll 1
             for (int k = 0; k < T; ++k) {
@@ -196,20 +229,30 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
             }
         } else {
             const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) (rr - LR) * D + col0);
-            uint4 u[NQ];
+            // as published, the NQ loads sat in 32 registers and the pass over the rows had all NQ steps unrolled: their bf16 -> f32
+            // conversions (64 values, the same for every row) were hoisted out of the pass and held through it, and inside a pass all the steps' loads
+            // were issued at once. One warp of one share in four runs this, but every wave of the kernel is given the registers its widest path needs:
+            // ~120 a wave, where the rest of the kernel needs ~75, and on an R9700 a wave's register count sets how many blocks are resident at once
+            // (the SIMD's register file is shared by its waves; at 120+ one 24-wave block fits a WGP). The weights now wait in shared memory and the
+            // steps run two at a time: the same products, each row's sum in the same order.
+            uint4* const hw = hu[(rr - LR) * H_TPRD + j];
 #pragma unroll
-            for (int q = 0; q < NQ; ++q) u[q] = __ldg(w4 + q * H_TPRD + j);
+            for (int q = 0; q < NQ; ++q) hw[q] = FNX_WLD2(w4 + q * H_TPRD + j);
 #pragma unroll 1
             for (int k = 0; k < T; ++k) {
                 float acc = 0.f;
+#pragma unroll 1
+                for (int q2 = 0; q2 < NQ; q2 += 2) {
 #pragma unroll
-                for (int q = 0; q < NQ; ++q) {
-                    const int ch = q * H_TPRD + j;
-                    const uint16_t* hh = reinterpret_cast<const uint16_t*>(&u[q]);
-                    const float4 x0 = *reinterpret_cast<const float4*>(&xs[k][ch * 8]);
-                    const float4 x1 = *reinterpret_cast<const float4*>(&xs[k][ch * 8 + 4]);
-                    acc += bf(hh[0]) * x0.x + bf(hh[1]) * x0.y + bf(hh[2]) * x0.z + bf(hh[3]) * x0.w + bf(hh[4]) * x1.x +
-                           bf(hh[5]) * x1.y + bf(hh[6]) * x1.z + bf(hh[7]) * x1.w;
+                    for (int q = q2; q < q2 + 2; ++q) {
+                        const int ch = q * H_TPRD + j;
+                        const uint4 uq = hw[q];
+                        const uint16_t* hh = reinterpret_cast<const uint16_t*>(&uq);
+                        const float4 x0 = *reinterpret_cast<const float4*>(&xs[k][ch * 8]);
+                        const float4 x1 = *reinterpret_cast<const float4*>(&xs[k][ch * 8 + 4]);
+                        acc += bf(hh[0]) * x0.x + bf(hh[1]) * x0.y + bf(hh[2]) * x0.z + bf(hh[3]) * x0.w + bf(hh[4]) * x1.x +
+                               bf(hh[5]) * x1.y + bf(hh[6]) * x1.z + bf(hh[7]) * x1.w;
+                    }
                 }
                 for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
                 if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
@@ -231,17 +274,18 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
             for (int cc = 0; cc < HC; ++cc) {
                 const size_t urow = (size_t) cc * N + vb * H_UPC + udd;
                 const uint4* wp = reinterpret_cast<const uint4*>(a.w_up.q + urow * LR + uj * 32);
-                wq[cc][0] = __ldg(wp);
-                wq[cc][1] = __ldg(wp + 1);
-                wsh[cc] = __ldg(a.w_up.d + urow * (LR / 32) + uj);
+                wq[cc][0] = FNX_WLD2(wp);
+                wq[cc][1] = FNX_WLD2(wp + 1);
+                wsh[cc] = FNX_WLD2(a.w_up.d + urow * (LR / 32) + uj);
             }
     };
     load_up(blockIdx.x);
-    grid_sync(a.bar, a.err, grid);
+    if (!HC_STUB(4)) grid_sync(a.bar, a.err, grid, a.timeout);
     if constexpr (ONE) {
         // ---------------- reduce, in every block: rs, then lo per (token k, lo block b) a warp into lq / ld
         if (t < T * HC) rs[t / HC][t % HC] = rs_of(a, t / HC, t % HC);
         __syncthreads();
+        if (!HC_STUB(16))
         for (int it = warp; it < T * (LR / 32); it += H_DT / 32) {
             const int k = it / (LR / 32), r = (it % (LR / 32)) * 32 + lane;
             float pv[H_NS];
@@ -275,7 +319,7 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
         __syncthreads();
     } else {
     // ---------------- reduce: item (token k, lo block b) per warp, then each token's inject rows
-    {
+    if (!HC_STUB(16)) {
         constexpr int ITEMS = T * (LR / 32) + T;
         for (int it = blockIdx.x * (H_DT / 32) + warp; it < ITEMS; it += grid * (H_DT / 32)) {
             const bool inj_item = it >= T * (LR / 32);
@@ -300,7 +344,7 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
             } else q8_block(silu_(sum / (float) HC), a.loq + k * LR + (r & ~31), a.lod + k * (LR / 32) + r / 32);
         }
     }
-    grid_sync(a.bar, a.err, grid);
+    if (!HC_STUB(4)) grid_sync(a.bar, a.err, grid, a.timeout);
     // ---------------- up
     if (t < T * HC) rs[t / HC][t % HC] = rs_of(a, t / HC, t % HC);
     for (int e = t; e < T * LR / 4; e += H_DT) reinterpret_cast<int*>(&lq[0][0])[e] = __ldcg(reinterpret_cast<const int*>(a.loq) + e);
@@ -318,6 +362,9 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
 #pragma unroll
     for (int cc = 0; cc < HC; ++cc) wsc[cc] = ulive ? f16(wsh[cc]) : 0.f;
     // one pass per row k, rolled (see the down part): the lane's block of lo against its block of each stream's row
+    // the waves past the up lanes (threads H_UPC * H_TPRU and up: 8 of a block's 24 waves) have no part in this pass and skip it whole
+    // (they ran it on zeros: a third of the pass's instructions on a card where the read is bound by them)
+    if (!HC_STUB(2) && t < H_UPC * H_TPRU)
 #pragma unroll 1
     for (int k = 0; k < T; ++k) {
         const int4* xp = reinterpret_cast<const int4*>(&lq[k][(ulive ? uj : 0) * 32]);
@@ -347,6 +394,7 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
     __syncthreads();
     // item (k, c, col): this block's 32 columns of stream c, row k, coalesced along the columns
     const int b = vb;
+    if (HC_STUB(32)) continue;
     for (int e = t; e < T * HC * H_UPC; e += H_DT) {
         const int col = e % H_UPC, cc = (e / H_UPC) % HC, k = e / (H_UPC * HC), dc = b * H_UPC + col;
         const float rv = rprime(a, k, cc, dc);

@@ -7,6 +7,7 @@
 #include <map>
 #include <vector>
 
+#include "env.hpp"
 #include "kernels.hpp"
 #include "model.hpp"
 #include "owned.hpp"
@@ -31,6 +32,25 @@ struct CardBuf {
     cudaStream_t st;
     cudaStream_t st2;                 // the shared expert, beside the routed ones
     cudaEvent_t fork, join;
+    // (FNX_MALL_PF): the side stream of the cache prefetch, its fork and join events, the sets per layer (this card's fixed weights of
+    // the layer in order of use, up to the cap), and whether the window being enqueued has forked one (its end then joins st3)
+#if FNX_MALL_PF
+    cudaStream_t st3 = nullptr;
+    cudaEvent_t pf_fork = nullptr, pf_join = nullptr;
+    std::vector<PfSet> pf_sets;
+    unsigned* pf_sink = nullptr;      // the prefetch kernel's sink word (PfSet::sink)
+    bool pf_open = false;
+    // FNX_MALL_PF_MODE=run (the persistent prefetcher, kernels.hpp PfRun): the sets and the words on the card, the fork points launched so far on
+    // this card (words[0] once they have run), the time-out in the card's ticks, the windows so far and the status bits already logged
+    PfSet* pf_table = nullptr;
+    unsigned* pf_words = nullptr;
+    unsigned pf_count = 0, pf_windows = 0, pf_seen = 0;
+    bool pf_own = false;              // st3 has a hardware queue of its own (mall_pf_stream)
+    unsigned long long pf_runs = 0, pf_runs_rep = 0;   // prefetchers launched; at the last staged-sets report
+    unsigned pf_rep[11] = {};                          // words[5], [6], [7], [8], [9], [10], [11], then [12..15] at the last report
+    int pf_full = 0;                                   // the window's sets that have something to stage
+    long long pf_timeout = 0;
+#endif
     float *R, *mixed, *bo_a, *bo_f, *inj_a, *inj_f, *hcs;
     void* xq;   // q8_1 rows
     float *qkvz, *ab;
@@ -73,6 +93,10 @@ struct CardBuf {
     size_t snap_block_bytes = 0;
     float* ple_hsnap;
     Ring ring;
+    // FNX_HC_SUM: a window sum not yet launched (Engine::sum_later); the next hc read of pend.x takes it (sum_take), anything else launches it first (sum_flush)
+    HcSumReq pend;
+    int pend_T = 0;
+    bool pend_on = false;
     AttRing att_ring;   // the attention partials' merge
     int* ctl;                         // [0] window position, [1] ring tag (as unsigned)
     int* mrope = nullptr;             // the current lane's rotary table (its LaneDev::mrope)
@@ -108,6 +132,11 @@ struct CardBuf {
         int* seg_row0 = nullptr;
     } eager_tab;
     std::vector<std::vector<GraphEntry>> batch_cache = std::vector<std::vector<GraphEntry>>(MAXT + 1);
+    CopyJob* mtp_jobs = nullptr;   // draft_lanes' table form: each lane's source rows' copy (copy_many in the call's graph)
+    float* mtp_last = nullptr;     //   and each lane's last row of logits, by lane (the candidates' launch reads them as its rows)
+    int* mtp_zero_l = nullptr;     //   MAXT zeros: no penalties for that launch's rows
+    float* mtp_ck_src = nullptr;   //   FNX_DRAFT_LANES_CHECK: the call's source rows, kept for the reference pass
+    std::vector<GraphEntry> dl_cache;   // Engine::draft_lanes' graphs by key (exec, key, used; no tables of their own)
     std::vector<unsigned long> batch_slot_used = std::vector<unsigned long>(MAXT + 1, 0);
     // batch_graphs[T]'s lane rows (LaneRows): [MAXT] each row's lane's ctl, then [MAXT] its page table; written when
     // the graph is captured, read by it
@@ -132,6 +161,10 @@ struct CardBuf {
     int *mtp_pen_l = nullptr, *mtp_tk_i_l = nullptr;
     float *mtp_pen_par_l = nullptr, *mtp_tk_v_l = nullptr;
     unsigned* mtp_tk_err_l = nullptr;
+    // the draft call's small inputs and results live in one block (draft_io below): mtp_ctl, mtp_pen_par, mtp_bv, mtp_bi, mtp_tk_*,
+    // mtp_lctl, mtp_row_pos, mtp_pen_par_l and mtp_emb point into it. mtp_pen_k: the count of the penalty list the card holds (-1: not known)
+    char* mtp_io = nullptr;
+    int mtp_pen_k = -1;
     int* mtp_pen = nullptr;        // the last row's penalties (penalize_row's pen, this card's draft-vocabulary indexes)
     float* mtp_pen_par = nullptr;
     float* mtp_tk_v = nullptr;     // the last row's TOPK_N candidates (draft(cands)); mtp_zero: no penalties for top_tokens
@@ -155,8 +188,35 @@ struct CardBuf {
 
 // what engine_common.cu reads of this model (engine_parts.hpp says what each is)
 constexpr int ROW_W = D;   // the HC streams of N
-constexpr int LANE_ROW_COLS = 2;
-inline void lane_row_extra(const int**, int, const LaneDev&) {}
+
+// byte offsets of the draft call's block (CardBuf::mtp_io on a card, Pinned::mtp_io on the host). A call uploads [0, EMB + its rows'
+// embeddings) in one copy and downloads [0, TK_V) or, with candidates, [0, RES_END) in one copy. A small copy costs its launch, not its bytes:
+// the call had 4 uploads and 3 to 6 downloads a card. The upload writes a zero to TK_ERR (the candidates' error word: no launch to clear it) and
+// passes over the result words, which the call's kernels write after it
+namespace draft_io {
+constexpr size_t TK_ERR = 0, CTL = 8, PEN_PAR = 16, BV = 32, BI = BV + (size_t) MAXT * 4, TK_V = BI + (size_t) MAXT * 4,
+                 TK_I = TK_V + (size_t) TOPK_N * 4, RES_END = TK_I + (size_t) TOPK_N * 4, LCTL = RES_END, ROW_POS = LCTL + (size_t) 2 * MAXT * 4,
+                 PEN_PAR_L = ROW_POS + (size_t) MAXT * 4, EMB = (PEN_PAR_L + (size_t) 3 * MAXT * 4 + 63) / 64 * 64,
+                 BYTES = EMB + (size_t) MAXT * N * 4;
+}
+// lane_rows' columns past the position and the page table: the lane's M-RoPE table (2), then a column a layer (3 + l) with
+// the lane's raw-key ring of an attention layer (the lane forms of the window's per-row attention steps read them)
+constexpr int LANE_ROW_COLS = 3 + NL;
+// FNX_DRAFT_LANES_TAB: Engine::draft_lanes' launches take the lanes from the card's tables (see draft_lanes). On where FNX_LANE_ATT
+// is (4 AMD cards: measured there); the other builds keep the launches a lane until they are measured
+inline bool draft_lanes_tab() {
+#if FNX_HIP
+    static const bool v = env_int("FNX_DRAFT_LANES_TAB", FAST && NCARD == 4 ? 1 : 0) != 0;
+#else
+    static const bool v = env_int("FNX_DRAFT_LANES_TAB", 0) != 0;
+#endif
+    return v;
+}
+inline void lane_row_extra(const int** rows, int r, const LaneDev& L) {
+    rows[(size_t) 2 * MAXT + r] = L.mrope;
+    for (int l = 0; l < NL; ++l)
+        if (is_attn(l)) rows[(size_t) (3 + l) * MAXT + r] = reinterpret_cast<const int*>(L.ring[(size_t) l]);
+}
 inline void card_lane(CardBuf& b, const LaneDev& L) {
     b.pt = L.pt;
     b.pg.pt = L.pt;

@@ -108,7 +108,7 @@ int BatchDecoder::draft_one(BatchLane& L, int T, bool from_main, int src_row, co
     Engine::Penalties::Row row;
     if (pen) row = penalty_row(pen_seq, L.s);
     int d = e_.draft(T, from_main, src_row, toks, pos0, pen ? &row : nullptr, samp);
-    ++last_calls;
+    ++last_calls, last_call_ms += e_.last_draft_ms, last_call_gpu_ms += e_.last_draft_gpu_ms;
     q = Dist{};
     if (samp) {
         std::uniform_real_distribution<double> unif(0.0, 1.0);
@@ -249,7 +249,7 @@ std::vector<BatchDecoder::Emitted> BatchDecoder::window(const std::vector<BatchL
     e_.commit_rows(keep);
     const int was = e_.lane();
     const auto td = std::chrono::steady_clock::now();
-    last_calls = 0;
+    last_calls = 0, last_call_ms = last_call_gpu_ms = 0.0;
     draft_next(lanes, going, r0, got);
     last_draft_ms = ms_since(td);
     e_.use_lane(was);
@@ -290,6 +290,16 @@ void BatchDecoder::draft_next(const std::vector<BatchLane*>& lanes, const std::v
     const int ng = (int) going.size();
     static const double df2_call_ms = env_num("FNX_DF2_CALL_MS", 2.5);   // one lane's drafter round (about 3 ms alone, overlapped between lanes)
     for (RowOffer& of : offers) of.first_ms = df2 ? df2_call_ms : 0.0;   // (a lane that drafts nothing banks its taps and pays no round)
+    // the batched window's cost on this rig when given (FNX_PLAN_BROUND_MS: a window of one row; FNX_PLAN_BROW_MS: each row more, one slope for
+    // all rows. 2 x R9700, IQ3_S: 12.6 and 2.26-2.34; the constants say 10.8 and 1.5 / 1.8), or with FNX_PLAN_LIVE=1 the engine's running fit of its
+    // held-graph windows (see Session::generate on what that costs: answers stop being the same from run to run)
+    static const double b_round = env_num("FNX_PLAN_BROUND_MS", 0.0), b_row = env_num("FNX_PLAN_BROW_MS", 0.0);
+    static const bool plan_live = env_int("FNX_PLAN_LIVE", 0) != 0;
+    if (!(b_round >= 0.0 && b_round <= 1000.0 && b_row >= 0.0 && b_row <= 1000.0))   // (0: not given; an unbounded cost made the plan's totals inf / NaN)
+        throw std::runtime_error("FNX_PLAN_BROUND_MS / FNX_PLAN_BROW_MS: want ms in (0, 1000]");
+    if (b_round > 0.0) cost_.round_ms = b_round;
+    if (b_row > 0.0) cost_.row_lo = cost_.row_hi = b_row;
+    if (double fa = 0, fb = 0; plan_live && e_.cost_fit[1].get(fa, fb)) cost_.round_ms = fa + fb, cost_.row_lo = cost_.row_hi = fb;
     const double base = cost_.round_ms + cost_.rows_ms(ng) + (mtp && !df2 ? cost_.call_ms * ng : 0.0);
     std::vector<int> plan;
     if (fixed_ >= 0) {
@@ -420,7 +430,7 @@ void BatchDecoder::draft_batched(const std::vector<BatchLane*>& lanes, const std
         off += used[g];
     }
     std::vector<int> d1 = e_.draft_lanes(rq);
-    ++last_calls;
+    ++last_calls, last_call_ms += e_.last_draft_ms, last_call_gpu_ms += e_.last_draft_gpu_ms;
     int deepest = 0;
     for (size_t g = 0; g < ng; ++g) {
         BatchLane& L = *lanes[(size_t) going[g]];
@@ -466,7 +476,7 @@ void BatchDecoder::draft_batched(const std::vector<BatchLane*>& lanes, const std
             who.push_back(g);
         }
         std::vector<int> dj = e_.draft_lanes(cr);
-        ++last_calls;
+        ++last_calls, last_call_ms += e_.last_draft_ms, last_call_gpu_ms += e_.last_draft_gpu_ms;
         for (size_t n = 0; n < who.size(); ++n) {
             const size_t g = who[n];
             BatchLane& L = *lanes[(size_t) going[g]];
@@ -508,7 +518,7 @@ void BatchDecoder::draft_df2(const std::vector<BatchLane*>& lanes, const std::ve
     }
     if (rq.empty()) return;
     e_.df2_draft(rq);
-    ++last_calls;
+    ++last_calls, last_call_ms += e_.last_draft_ms, last_call_gpu_ms += e_.last_draft_gpu_ms;
     for (size_t n = 0; n < who.size(); ++n) {
         const size_t g = who[n];
         BatchLane& L = *lanes[(size_t) going[g]];

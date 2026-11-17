@@ -142,6 +142,34 @@ int main() {
         expect(f.q[0].first == "GEN 5 1" && f.in.stop_now, "CRLF line ends");
         f.in.end();
     }
+    {
+        // run_fd (the engine's reader: 64 KiB reads from a descriptor) queues what run (std::getline) queues, with the same numbers and flags
+        std::string big = "GEN 5 ";   // a request line longer than three reads
+        for (int i = 0; i < 40000; ++i) big += std::to_string(100000 + i) + (i + 1 < 40000 ? "," : "");
+        const std::string scripts[] = {"GEN 5 1,2\nBGEN 1 5 3\nQUIT\n", "GEN 5 1\r\nSTOP\r\n", "BSTOP 9\nBYIELD -1\nGEN 5 1\n", "BSTOP x\n\nBSTOP3\n",
+                                       "BGEN 2 5 7\nBSTOP 2\nBGEN 2 5 8\nGEN 5 1\nBYIELD 3\n", "GEN 5 1,2", big + "\nSTOP\n" + big + "\r\nGEN 4 9", ""};
+        bool same = true, long_ok = false;
+        for (const std::string& sc : scripts) {
+            Fed a(sc);
+            sfnx::Input in;
+            std::FILE* tf = std::tmpfile();
+            std::fwrite(sc.data(), 1, sc.size(), tf);
+            std::fflush(tf);
+            std::rewind(tf);
+            in.run_fd(fileno(tf));
+            std::fclose(tf);
+            std::vector<std::pair<std::string, long>> q;
+            std::string line;
+            long n = 0;
+            while (in.next(line, n, false)) q.emplace_back(line, n);
+            same = same && q == a.q && in.closed() && in.stop_upto == a.in.stop_upto && in.solo_yield_upto == a.in.solo_yield_upto &&
+                   in.solo_yield_slot == a.in.solo_yield_slot;
+            for (int i = 0; i < sfnx::MAX_SLOTS; ++i) same = same && in.bstop_upto[i] == a.in.bstop_upto[i] && in.yield_upto[i] == a.in.yield_upto[i];
+            if (sc.size() > 200000) long_ok = q.size() == 3 && q[0].first == big && q[1].first == big && q[2].first == "GEN 4 9" && in.stop_upto == 1;
+        }
+        expect(same, "run_fd queues the same lines, numbers and flags as run (8 scripts)");
+        expect(long_ok, "run_fd: a 280 KB line across reads, CRLF, a last line without its newline");
+    }
     std::printf(failures ? "sfnx_input_test: %d FAILED\n" : "sfnx_input_test: all ok\n", failures);
     return failures ? 1 : 0;
 }

@@ -1,7 +1,10 @@
 // fnx kernels. Quantized dot products are ggml's (vecdotq.cuh) arithmetic in qdot.cuh, the rest follows llama.cpp's qwen4exp graph
 // (src/models/qwen4exp.cpp) operation by operation.
+#include <mutex>
 #include "kernels.hpp"
 #include "env.hpp"
+#include "kprof.hpp"
+#include "tk.hpp"   // generator: a launch site's kernel from a code object (FNX_TK_DIR, FNX_TK_<FAMILY>)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -9,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +22,9 @@
 
 #include "qdot.cuh"        // the quantized decode dots (ggml vecdotq.cuh's arithmetic, MIT; see the file)
 #include "iqdot_hip.cuh"   // HIP: the i-quant dots with a cheaper sign expansion (same integers as ggml's)
+#include "nt_load.cuh"     // FNX_WLD1 / FNX_WLD2, the weight streams' loads (non-temporal by FNX_MALL_NT)
+#include "mm.cuh"          // the int8 matrix instruction (FNX_MM)
+#include "diag.cuh"        // the time-out branches' record (ErrDiag)
 
 // compiled in parts (Makefile: build/kernels_pN.o with -DFNX_KPART=N), each with its share of the launchers below and
 // so only the template kernels they instantiate: one file's ~700 kernels took ~7 minutes on one core
@@ -32,6 +39,7 @@ namespace {
 void ck_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+    if (g_kprof_dev >= 0) kprof_mark(what);
 }
 
 __device__ __forceinline__ float wsum(float v) {
@@ -214,7 +222,7 @@ __global__ void __launch_bounds__(256) k_gemv_f32(const float* __restrict__ W, c
     const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + part * NC * 32;
     float4 wv[NC];
 #pragma unroll
-    for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+    for (int i = 0; i < NC; ++i) wv[i] = FNX_WLD2(w4 + i * 32 + lane);
     float s[T];
 #pragma unroll
     for (int t = 0; t < T; ++t) {
@@ -258,7 +266,7 @@ __device__ __forceinline__ void gemv4_block(const float* __restrict__ W, const f
         const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + warp * NC * 32;
         float4 wv[NC];
 #pragma unroll
-        for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+        for (int i = 0; i < NC; ++i) wv[i] = FNX_WLD2(w4 + i * 32 + lane);
 #pragma unroll
         for (int t = 0; t < T; ++t) {
             const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) t * N) + warp * NC * 32;
@@ -290,9 +298,20 @@ __global__ void __launch_bounds__(Q8S_THREADS) k_q8s_ab(const Q8Segs g, int rows
     if ((int) blockIdx.x < rf) gemv4_block<T>(W, x, yf, rf, blockIdx.x);
     else q8s_block<T, R, SPLIT, false>(g, rows, cols, y, tq, td, blockIdx.x - rf);
 }
+#if FNX_MM && FNX_HIP
+// the same launch with the matrix kernel's blocks (16 rows each) after the f32 rows'
+template <int T, bool SPLIT>
+__global__ void __launch_bounds__(Q8S_THREADS) k_q8s_ab_mm(const Q8Segs g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                                          const int8_t* __restrict__ tq, const float* __restrict__ td, const float* __restrict__ W,
+                                                          const float* __restrict__ x, float* __restrict__ yf, int rf) {
+    if ((int) blockIdx.x < rf) gemv4_block<T>(W, x, yf, rf, blockIdx.x);
+    else q8s_mm_block<T, SPLIT, false>(g, rows, cols, y, tq, td, blockIdx.x - rf);
+}
+#endif
 
 // ---------------------------------------------------------------- hyper-connection read
 #include "hc.cuh"
+#include "hc_mm.cuh"   // the read as a ticket queue (FNX_MM_HC)
 
 // ---------------------------------------------------------------- MoE routing, swiglu, combine
 __global__ void k_topk(const float* logits, int* topi, float* topw) {
@@ -490,11 +509,13 @@ __device__ void norm_rope(float* x, const float* w, int pos, float eps, const Ro
     }
 }
 
-__global__ void k_attn_prep(float* qg, float* k, const float* qn, const float* kn, int nq, int nkv, const int* pos0p, float eps, Rope base) {
-    const int t = blockIdx.y, h = blockIdx.x, pos0 = *pos0p;
+__global__ void k_attn_prep(float* qg, float* k, const float* qn, const float* kn, int nq, int nkv, const int* pos0p, float eps, Rope base,
+                            LaneRows lr) {
+    const int t = blockIdx.y, h = blockIdx.x, p = row_pos(lr, pos0p, t);
     __shared__ float sh[32];
-    if (h < nq) norm_rope(qg + ((size_t) t * nq + h) * 2 * HD, qn, pos0 + t, eps, base, sh);
-    else norm_rope(k + ((size_t) t * nkv + (h - nq)) * HD, kn, pos0 + t, eps, base, sh);
+    base = row_rope(base, lr, t);
+    if (h < nq) norm_rope(qg + ((size_t) t * nq + h) * 2 * HD, qn, p, eps, base, sh);
+    else norm_rope(k + ((size_t) t * nkv + (h - nq)) * HD, kn, p, eps, base, sh);
 }
 
 #include "qsa.cuh"
@@ -503,7 +524,12 @@ __global__ void k_attn_prep(float* qg, float* k, const float* qn, const float* k
 // [0, pos0 + t] (len: the context over ATT_SPLITS, rounded up to ATT_CH) in chunks of ATT_CH, for the local q heads
 // of that KV head, with an online softmax; it writes each head's running max, sum and HD accumulators. The combine
 // (block per local head and row) weighs the splits by exp(max_s - max), divides, and applies sigmoid(gate).
-constexpr int ATT_SPLITS = 16, ATT_CH = 32, ATT_QPK = NQH / NKVH, ATT_MAXH = ATT_QPK, ATT_OWN = NQH / NCARD;
+// FNX_ATT_HEADS: a card attends 4x the positions for half the heads, so twice the splits keep the blocks per row the same
+#ifndef FNX_ATT_SPLITS_H
+#define FNX_ATT_SPLITS_H 32
+#endif
+constexpr int ATT_SPLITS = ATT_HEADS ? FNX_ATT_SPLITS_H : 16, ATT_CH = 32, ATT_QPK = NQH / NKVH, ATT_MAXH = ATT_QPK, ATT_OWN = NQH / NCARD;
+static_assert(!ATT_HEADS || ATT_OWN == NQH_LOC, "by heads, a card's own heads are the heads it attends");
 constexpr int ATT_ROWS = 64;   // rows the attention's scratch and merge ring hold (a prompt group; windows use MAXT)
 struct AttPart {
     float m, z;
@@ -511,6 +537,7 @@ struct AttPart {
 
 // positions <= p that card owns (block j on card kv_card(j)): its blocks before p's block whole, then p's up to p
 __device__ __forceinline__ int kv_owned(int p, int card) {
+    if (ATT_HEADS) return p + 1;   // by heads: every position
     const int b = p / 4;
     const int blocks = (b + NCARD - 1 - card) / NCARD;   // blocks j < b with j % NCARD == card
     return blocks * 4 + (kv_card(b) == card ? p % 4 + 1 : 0);
@@ -654,12 +681,18 @@ __global__ void __launch_bounds__(HD) k_att_merge(AttRing r, const float* qg, co
         *(volatile unsigned long long*) p = (unsigned long long) __float_as_uint(v) | ((unsigned long long) tag << 32);
     };
     auto take = [&](const unsigned long long* p) {
-        const long long t0 = clock64();
+        const long long ts = clock64();
+        long long t0 = ts;
         unsigned long long w;
         for (;;) {
             w = *(const volatile unsigned long long*) p;
             if ((unsigned) (w >> 32) == tag) break;
-            if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
+            if (const long long dt = clock64() - t0; __builtin_expect(dt > RING_TIMEOUT_CYCLES, 0)) {
+                if (diag_wait_on(r.err, dt, RING_TIMEOUT_CYCLES, ts, t0)) continue;   // the driver had the queues off the cards
+                diag_timeout(r.err, DK_ATT_MERGE, tag, (unsigned) (w >> 32), (unsigned) w, DG_NO_SRC, (unsigned) (t * ATT_OWN + hl), dt);
+                atomicOr(r.err, 1u);
+                break;
+            }
         }
         return __uint_as_float((unsigned) w);
     };
@@ -709,12 +742,18 @@ __global__ void __launch_bounds__(HD) k_att_merge_a2a(AttRing r, const float* qg
         *(volatile unsigned long long*) p = (unsigned long long) __float_as_uint(v) | ((unsigned long long) tag << 32);
     };
     auto take = [&](const unsigned long long* p) {
-        const long long t0 = clock64();
+        const long long ts = clock64();
+        long long t0 = ts;
         unsigned long long w;
         for (;;) {
             w = *(const volatile unsigned long long*) p;
             if ((unsigned) (w >> 32) == tag) break;
-            if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
+            if (const long long dt = clock64() - t0; __builtin_expect(dt > RING_TIMEOUT_CYCLES, 0)) {
+                if (diag_wait_on(r.err, dt, RING_TIMEOUT_CYCLES, ts, t0)) continue;   // the driver had the queues off the cards
+                diag_timeout(r.err, DK_ATT_MERGE, tag, (unsigned) (w >> 32), (unsigned) w, DG_NO_SRC, (unsigned) (t * ATT_OWN + hl), dt);
+                atomicOr(r.err, 1u);
+                break;
+            }
         }
         return __uint_as_float((unsigned) w);
     };
@@ -763,7 +802,9 @@ __global__ void __launch_bounds__(HD) k_attn_combine(const float* qg, const floa
     out[((size_t) t * nq + h) * HD + i] = acc / z * sigm(qg[((size_t) t * nq + h) * 2 * HD + HD + i]);
 }
 
+#include "attn_mm.cuh"
 #include "attn_prompt.cuh"
+#include "gdn_mm_prompt.cuh"   // the prompt GDN recurrence on WMMA (FNX_PF_GDN_MM)
 #include "attn_prompt_i8.cuh"
 #include "topk.cuh"
 
@@ -837,13 +878,20 @@ __device__ __forceinline__ void rput32(unsigned long long* p, float2 v, unsigned
     *(volatile unsigned long long*) p = (unsigned long long) __float_as_uint(v.x) | t;
     *(volatile unsigned long long*) (p + 1) = (unsigned long long) __float_as_uint(v.y) | t;
 }
-__device__ __forceinline__ float rtake1(const unsigned long long* p, unsigned tag, unsigned* err) {
-    const long long t0 = clock64();
+// timeout in clock64 cycles (Ring::timeout); src (the card whose word this is) and elem only go into the time-out's record
+__device__ __forceinline__ float rtake1(const unsigned long long* p, unsigned tag, unsigned* err, long long timeout, unsigned src, unsigned elem) {
+    const long long ts = clock64();
+    long long t0 = ts;
     unsigned long long w;
     for (;;) {
         w = *(const volatile unsigned long long*) p;
         if ((unsigned) (w >> 32) == tag) break;
-        if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+        if (const long long dt = clock64() - t0; __builtin_expect(dt > timeout, 0)) {
+            if (diag_wait_on(err, dt, timeout, ts, t0)) continue;   // the driver had the queues off the cards
+            diag_timeout(err, DK_RING_F32, tag, (unsigned) (w >> 32), (unsigned) w, src, elem, dt);
+            atomicOr(err, 1u);
+            break;
+        }
     }
     return __uint_as_float((unsigned) w);
 }
@@ -852,13 +900,20 @@ __device__ __forceinline__ void rput(unsigned long long* p, float2 v, unsigned t
     const __half2 h = __floats2half2_rn(v.x, v.y);
     *(volatile unsigned long long*) p = (unsigned long long) *reinterpret_cast<const unsigned*>(&h) | ((unsigned long long) tag << 32);
 }
-__device__ __forceinline__ float2 rtake(const unsigned long long* p, unsigned tag, unsigned* err) {
-    const long long t0 = clock64();
+__device__ __forceinline__ float2 rtake(const unsigned long long* p, unsigned tag, unsigned* err, long long timeout, unsigned src, unsigned elem,
+                                        unsigned kind = DK_RING) {
+    const long long ts = clock64();
+    long long t0 = ts;
     unsigned long long w;
     for (;;) {
         w = *(const volatile unsigned long long*) p;
         if ((unsigned) (w >> 32) == tag) break;
-        if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+        if (const long long dt = clock64() - t0; __builtin_expect(dt > timeout, 0)) {
+            if (diag_wait_on(err, dt, timeout, ts, t0)) continue;   // the driver had the queues off the cards
+            diag_timeout(err, kind, tag, (unsigned) (w >> 32), (unsigned) w, src, elem, dt);
+            atomicOr(err, 1u);
+            break;
+        }
     }
     const unsigned lo = (unsigned) w;
     return __half22float2(*reinterpret_cast<const __half2*>(&lo));
@@ -879,6 +934,53 @@ __device__ __forceinline__ float2 ring_x2(const float* x, const RingMoe& m, int 
     return make_float2(ring_x(x, m, T, t, 2 * p), ring_x(x, m, T, t, 2 * p + 1));
 }
 
+#if FNX_MM_HC && FNX_HIP
+// (FNX_HC_SUM): the window's one-hop sum (k_ring_a2a below: the same steps on every pair, the same words in the same host mailboxes) as the
+// first tickets of the hc read that applies the summed output (hc_mm.cuh, hc_mm_run's SUM). x is the read's a.bo.
+struct HmRingSum {
+    static constexpr bool on = true;
+    Ring r;
+    float* x;
+    const unsigned* tagp;
+    int call;
+    RingMoe m;
+    __device__ __forceinline__ unsigned tag() const { return *tagp * 256u + (unsigned) call + 1u; }
+    __device__ __forceinline__ void start() const { diag_prog(r.err, tag()); }
+    // how long a sum ticket may take: a wait for each peer's word, one after the other, each with the ring's time-out (saturating)
+    __device__ __forceinline__ long long patience() const {
+        constexpr long long top = 0x7fffffffffffffffll;
+        return r.timeout > top / (NCARD - 1) ? top : r.timeout * (NCARD - 1);
+    }
+    // token k's pairs c * 256 .. c * 256 + 255: this thread's pair
+    template <int T>
+    __device__ __forceinline__ void ticket(int k, int c) const {
+        static_assert(NP == HM_SUMT * HM_T, "the read's sum tickets cover a token's pairs");
+        if (*(volatile const unsigned*) r.err & 1u) return;   // a peer never came: do not wait out every element's timeout
+        const unsigned tg = tag();
+        const int p = c * HM_T + (int) threadIdx.x;
+        const size_t e = (size_t) k * NP + p, set_sz = (size_t) MAXT * NP;
+        const float2 v = ring_x2(x, m, T, k, p);
+        if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) atomicOr(r.err, 2u);   // out of range (or NaN)
+        const __half2 h = __floats2half2_rn(v.x, v.y);
+        *(volatile unsigned long long*) ((unsigned long long*) r.in + (tg & 1) * set_sz + e) =
+            (unsigned long long) *reinterpret_cast<const unsigned*>(&h) | ((unsigned long long) tg << 32);   // volatile: system-coherent, as the ring's words
+        float2 sum = make_float2(0.f, 0.f);
+#pragma unroll
+        for (int src = 0; src < NCARD; ++src) {
+            const float2 w = src == r.card ? __half22float2(h)
+                                           : rtake((const unsigned long long*) r.peer_in[src] + (tg & 1) * set_sz + e, tg, r.err, r.timeout, (unsigned) src, (unsigned) e);
+            sum = src == 0 ? w : add2(sum, w);
+        }
+        x[2 * e] = sum.x;
+        x[2 * e + 1] = sum.y;
+    }
+};
+template <int T>
+__global__ void __launch_bounds__(HM_T) k_hc_mm_sum(HcArgs a, unsigned* q, HmRingSum sm) {
+    hc_mm_run<T, HmRingSum>(a, q, sm);
+}
+#endif
+
 template <bool F32>
 __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
     constexpr int W = F32 ? 2 : 1;   // words per pair
@@ -886,11 +988,13 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
         if constexpr (F32) rput32(p, v, tg, r.err);
         else rput(p, v, tg, r.err);
     };
-    auto take = [&](const unsigned long long* p, unsigned tg) {
-        if constexpr (F32) return make_float2(rtake1(p, tg, r.err), rtake1(p + 1, tg, r.err));
-        else return rtake(p, tg, r.err);
+    const unsigned prev = (unsigned) ((r.card + NCARD - 1) % NCARD);   // the ring's words come from the card before (the time-out's record names it)
+    auto take = [&](const unsigned long long* p, unsigned tg, unsigned el) {   // el: row * NP + pair, for the record only
+        if constexpr (F32) return make_float2(rtake1(p, tg, r.err, r.timeout, prev, el), rtake1(p + 1, tg, r.err, r.timeout, prev, el));
+        else return rtake(p, tg, r.err, r.timeout, prev, el, DK_RING_CHAIN);
     };
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
+    diag_prog(r.err, tag);
     const int n = gridDim.x * blockDim.x, tid = blockIdx.x * blockDim.x + threadIdx.x, g = r.card;
     // two buffer sets, alternating by tag: a card can start sum k+1 before a peer has drained sum k, never k+2
     const size_t in_set = (size_t) RSTEPS * r.rows * RCH * W, ag_set = (size_t) r.rows * N * W;
@@ -911,7 +1015,7 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
         const int c = (g + NCARD - s) % NCARD, lo = clo(c), len = chi(c) - lo;
         for (int e = tid; e < T * len; e += n) {
             const int t = e / len, i = e % len;
-            const float2 a = take(slot(in, s - 1, t, i), tag);
+            const float2 a = take(slot(in, s - 1, t, i), tag, (unsigned) (t * NP + lo + i));
             put(slot(nin, s, t, i), add2(a, ring_x2(x, m, T, t, lo + i)), tag);
         }
     }
@@ -919,7 +1023,7 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
         const int c = (g + 1) % NCARD, lo = clo(c), len = chi(c) - lo;
         for (int e = tid; e < T * len; e += n) {
             const int t = e / len, i = e % len;
-            const float2 a = take(slot(in, RSTEPS - 1, t, i), tag);
+            const float2 a = take(slot(in, RSTEPS - 1, t, i), tag, (unsigned) (t * NP + lo + i));
             const float2 v = add2(a, ring_x2(x, m, T, t, lo + i));
             put(ag + ((size_t) t * NP + lo + i) * W, v, tag);
             put(nag + ((size_t) t * NP + lo + i) * W, v, tag);
@@ -930,12 +1034,12 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
         const int c = (g + NCARD - f + 1) % NCARD, lo = clo(c), len = chi(c) - lo;
         for (int e = tid; e < T * len; e += n) {
             const int t = e / len, i = e % len;
-            put(nag + ((size_t) t * NP + lo + i) * W, take(ag + ((size_t) t * NP + lo + i) * W, tag), tag);
+            put(nag + ((size_t) t * NP + lo + i) * W, take(ag + ((size_t) t * NP + lo + i) * W, tag, (unsigned) (t * NP + lo + i)), tag);
         }
     }
     // everything: written back into x
     for (int e = tid; e < T * NP; e += n) {
-        const float2 v = take(ag + (size_t) e * W, tag);
+        const float2 v = take(ag + (size_t) e * W, tag, (unsigned) e);
         x[2 * e] = v.x;
         x[2 * e + 1] = v.y;
     }
@@ -952,6 +1056,7 @@ __global__ void k_ring_a2a(Ring r, float* x, int T, const unsigned* tagp, int ca
     static_assert(NCARD < 3 || NP <= 2 * (NCARD - 1) * RCH, "the one-hop sum's mailbox (2 sets x MAXT x NP words) must fit the ring's receive buffer");
     const size_t set_sz = (size_t) MAXT * NP;
     unsigned long long* mine = (unsigned long long*) r.in + (tag & 1) * set_sz;
+    diag_prog(r.err, tag);
     for (int e = tid; e < T * NP; e += n) {
         if (*(volatile const unsigned*) r.err & 1u) return;   // a peer never came: do not wait out every element's timeout
         const int t = e / NP, p = e % NP;
@@ -962,7 +1067,8 @@ __global__ void k_ring_a2a(Ring r, float* x, int T, const unsigned* tagp, int ca
         float2 sum = make_float2(0.f, 0.f);
 #pragma unroll
         for (int src = 0; src < NCARD; ++src) {
-            const float2 w = src == g ? __half22float2(h) : rtake((const unsigned long long*) r.peer_in[src] + (tag & 1) * set_sz + e, tag, r.err);
+            const float2 w = src == g ? __half22float2(h)
+                                      : rtake((const unsigned long long*) r.peer_in[src] + (tag & 1) * set_sz + e, tag, r.err, r.timeout, (unsigned) src, (unsigned) e);
             sum = src == 0 ? w : add2(sum, w);
         }
         x[2 * e] = sum.x;
@@ -974,12 +1080,52 @@ __global__ void k_ring_a2a(Ring r, float* x, int T, const unsigned* tagp, int ca
 // slot [source = this card] of every other card's mailbox (a posted remote store, 27 GB/s, no cache to go stale), then reads its own mailbox (local memory) for the
 // others' words and adds all NCARD values in card order. A flag round trip over peer memory is 2.1-2.3 us against 13-20 us for stream flags; reads FROM a peer are
 // slow across the two pairs of this box, which is why nothing here reads remote memory.
+// TWO (FNX_RING_2PHASE, on in a FAST build): a thread pushes ALL of its elements (up to 4 at a time) before it waits for any of the peers' words. As
+// published a thread with k elements pushed one, waited for that element's words, pushed the next: k round trips in series on both sides (k = 2 on two cards,
+// 4 on four at every row count, from the grid's size). The values and the order of every sum are unchanged.
+template <bool TWO>
 __global__ void k_ring_a2a_push(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int g = r.card, n = gridDim.x * blockDim.x, tid = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t slot = (size_t) MAXT * NP, set_sz = (size_t) NCARD * slot;
     const size_t off = (size_t) (tag & 1) * set_sz;
     unsigned long long* mine = (unsigned long long*) r.pk + off;
+    diag_prog(r.err, tag);
+    if constexpr (TWO) {
+        constexpr int G = 4;
+        for (int e0 = tid; e0 < T * NP; e0 += G * n) {
+            if (*(volatile const unsigned*) r.err & 1u) return;   // a peer never came: do not wait out every element's timeout
+            __half2 h[G];
+#pragma unroll
+            for (int j = 0; j < G; ++j) {
+                const int e = e0 + j * n;
+                if (e >= T * NP) break;
+                const int t = e / NP, p = e % NP;
+                const float2 v = ring_x2(x, m, T, t, p);
+                if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) atomicOr(r.err, 2u);   // out of range (or NaN)
+                h[j] = __floats2half2_rn(v.x, v.y);
+                const unsigned long long word = (unsigned long long) *reinterpret_cast<const unsigned*>(&h[j]) | ((unsigned long long) tag << 32);
+#pragma unroll
+                for (int d = 0; d < NCARD; ++d)
+                    if (d != g) *(volatile unsigned long long*) ((unsigned long long*) r.peer_pk[d] + off + (size_t) g * slot + e) = word;
+            }
+#pragma unroll
+            for (int j = 0; j < G; ++j) {
+                const int e = e0 + j * n;
+                if (e >= T * NP) break;
+                if (*(volatile const unsigned*) r.err & 1u) return;   // a take timed out: the thread's other elements do not wait their time-outs out too
+                float2 sum = make_float2(0.f, 0.f);
+#pragma unroll
+                for (int src = 0; src < NCARD; ++src) {
+                    const float2 w = src == g ? __half22float2(h[j]) : rtake(mine + (size_t) src * slot + e, tag, r.err, r.timeout, (unsigned) src, (unsigned) e);
+                    sum = src == 0 ? w : add2(sum, w);
+                }
+                x[2 * e] = sum.x;
+                x[2 * e + 1] = sum.y;
+            }
+        }
+        return;
+    }
     for (int e = tid; e < T * NP; e += n) {
         if (*(volatile const unsigned*) r.err & 1u) return;   // a peer never came: do not wait out every element's timeout
         const int t = e / NP, p = e % NP;
@@ -993,7 +1139,7 @@ __global__ void k_ring_a2a_push(Ring r, float* x, int T, const unsigned* tagp, i
         float2 sum = make_float2(0.f, 0.f);
 #pragma unroll
         for (int src = 0; src < NCARD; ++src) {
-            const float2 w = src == g ? __half22float2(h) : rtake(mine + (size_t) src * slot + e, tag, r.err);
+            const float2 w = src == g ? __half22float2(h) : rtake(mine + (size_t) src * slot + e, tag, r.err, r.timeout, (unsigned) src, (unsigned) e);
             sum = src == 0 ? w : add2(sum, w);
         }
         x[2 * e] = sum.x;
@@ -1041,10 +1187,43 @@ __global__ void k_argmax_fin(unsigned long long* keys, int T, int v0, float* bv,
     keys[t] = 0ull;
 }
 
+// ---------------------------------------------------------------- the clocks' calibration and the test hooks
+// one spin of 2^22 core-clock cycles (about 2 ms), timed on the steady counter too: the card's clock64 rate at load
+__global__ void k_diag_clock(unsigned* err) {
+    const long long w0 = diag_wall(), c0 = clock64();
+    long long c1 = c0;
+    while (c1 - c0 < (1LL << 22)) c1 = clock64();
+    const long long w1 = diag_wall();
+    *(volatile unsigned*) (err + DG_CAL0_CYC) = (unsigned) (c1 - c0);
+    *(volatile unsigned*) (err + DG_CAL0_WALL) = (unsigned) (w1 - w0);
+    *(volatile unsigned*) (err + DG_NOW_LO) = (unsigned) w1;
+    *(volatile unsigned*) (err + DG_NOW_HI) = (unsigned) ((unsigned long long) w1 >> 32);
+}
+// FNX_DIAG_STALL, mode dev: holds the stream for `ticks` of the steady counter (the host allows 30 s at most; bounded by 2^38 cycles of the core clock,
+// over a minute at any clock rate of these cards, so a steady counter that stands still cannot hold the card for ever)
+__global__ void k_diag_spin(long long ticks) {
+    const long long w0 = diag_wall(), c0 = clock64();
+    while (diag_wall() - w0 < ticks && clock64() - c0 < (1LL << 38)) __nanosleep(64);
+}
+// FNX_DIAG_STALL, mode tag: *p += add in stream order (a card's tag word made wrong for one window)
+__global__ void k_diag_poke(unsigned* p, unsigned add) { *p += add; }
+
 }  // namespace
 
 // ================================================================ launch wrappers
 #if FNX_KPART == 0
+void diag_clock(unsigned* err, void* st) {
+    k_diag_clock<<<1, 1, 0, (cudaStream_t) st>>>(err);
+    ck_launch("diag_clock");
+}
+void diag_spin(long long ticks, void* st) {
+    k_diag_spin<<<1, 1, 0, (cudaStream_t) st>>>(ticks);
+    ck_launch("diag_spin");
+}
+void diag_poke(unsigned* p, unsigned add, void* st) {
+    k_diag_poke<<<1, 1, 0, (cudaStream_t) st>>>(p, add);
+    ck_launch("diag_poke");
+}
 std::vector<Q8Twin>& q8_twins() {
     static std::vector<Q8Twin> v;
     return v;
@@ -1137,13 +1316,21 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, 
 
 #endif
 #if FNX_KPART == 3
-size_t hc_scratch_floats(int T) { return (size_t) H_NS * T * H_ROWS + (size_t) T * H_NS + (size_t) T * LR / 4 + (size_t) T * LR / 32 + 1; }
+// (the last two floats: the barrier counters, of the card's grid and, of its second grid for wider reads)
+size_t hc_scratch_floats(int T) { return (size_t) H_NS * T * H_ROWS + (size_t) T * H_NS + (size_t) T * LR / 4 + (size_t) T * LR / 32 + 2; }
 
 // FNX_HC1=R: windows of up to R rows (at most 8) take k_hc's one-barrier form (default 3: kbench 1-2 us faster a read at
 // 1-3 rows, the same at 4-5, slower at 8). Read once; the engine reads it when made, so a bad value fails at start
 int hc1_rows() {
     static const int rows = [] {
-        const long long r = env_int("FNX_HC1", 3);
+        // 8 on HIP in a FAST build (FNX_HC1_WIDE): on an R9700 the one-barrier form is 2-3.4 us a read faster at 4-8 rows too (kbench between dense
+        // launches, 4 / 5 / 6 / 8 rows: 33.2 / 35.4 / 38.9 / 48.9 us against 36.6 / 38.2 / 41.5 / 50.8); the same bits either way
+#if FNX_HIP
+        static const long long def = fast_opt("FNX_HC1_WIDE") ? 8 : 3;
+#else
+        static const long long def = 3;
+#endif
+        const long long r = env_int("FNX_HC1", def);
         if (r < 0 || r > 8) throw std::runtime_error("FNX_HC1: 0 (off) .. 8 rows, got " + std::to_string(r));
         return (int) r;
     }();
@@ -1151,10 +1338,48 @@ int hc1_rows() {
 }
 
 int hc_blocks() { return H_BLOCKS; }
+#if !(FNX_MM_HC && FNX_HIP)
+int hc_mm_grid() { return 0; }
+int hc_sum_rows() { return 0; }
+#endif
+#if FNX_KBENCH
+int hc_stub_ = 0;
+void hc_set_stub(int bits) { hc_stub_ = bits; }
+#endif
 
 // the read's grid on each card (0: hc_prepare not run there)
 constexpr int HC_MAXDEV = 64;
 int hc_grid_[HC_MAXDEV] = {};
+// FNX_HC_GRID2 (HIP, on in a FAST build): a second, larger grid for reads of HC_BIG_ROWS rows and more (0: none). An R9700 reports 32 "SMs" (WGPs) and
+// the read's 80 shares took three turns on 32 blocks, half the blocks idle in the third. With the kernel at ~100 registers a wave (hc.cuh, the inject rows)
+// two 24-wave blocks fit a WGP, and 48 blocks take the shares in two turns: kbench between dense launches, 32 -> 48 blocks at 4 / 5 / 6 / 8 / 16 rows:
+// 33.3 -> 31.9, 35.9 -> 33.1, 39.4 -> 35.2, 49.6 -> 42.9, 85.3 -> 72.6 us a read; slower at 1 row (21.8 -> 24.4) and equal at 3, so the narrow reads
+// keep the card's grid. The same sums in the same order whatever the grid, so the same bits. Each grid has its own barrier counter (a counter counts in
+// generations of ONE grid). hc_prepare tries the larger grid first (hc_probe): if its blocks are not all resident on this card it is not used.
+constexpr int HC_BIG_ROWS = 4;
+int hc_grid_big_[HC_MAXDEV] = {};
+
+#if FNX_MM_HC && FNX_HIP
+// the ticket queue of each card's reads (hc_mm.cuh), made and zeroed by hc_prepare; and the grid of k_hc_mm, FNX_MM_HC_GRID blocks
+// (default 96: any grid gives the same sums; blocks past the tickets leave at once)
+unsigned* hc_mm_q_[HC_MAXDEV] = {};
+int hc_sum_rows() {
+    static const int rows = [] {
+        const long long r = env_int("FNX_HC_SUM", APPROX ? 8 : 0);
+        if (r < 0 || r > MAXT) throw std::runtime_error("FNX_HC_SUM: 0 (off) .. " + std::to_string(MAXT) + " rows, got " + std::to_string(r));
+        return (int) r;
+    }();
+    return rows;
+}
+int hc_mm_grid() {
+    static const int grid = [] {
+        const long long g = env_int("FNX_MM_HC_GRID", 96);
+        if (g < 1 || g > 256) throw std::runtime_error("FNX_MM_HC_GRID: 1..256 blocks, got " + std::to_string(g));
+        return (int) g;
+    }();
+    return grid;
+}
+#endif
 
 int hc_dev() {
     int dev = -1;
@@ -1168,6 +1393,91 @@ int hc_grid() {
     const int dev = hc_dev();
     if (!hc_grid_[dev]) throw std::runtime_error("hc_read: hc_prepare was not run on card " + std::to_string(dev));
     return hc_grid_[dev];
+}
+
+// are `grid` blocks of the read resident together on the current card? The widest and a narrow read of both forms run once on zeros with a
+// short barrier time-out (20 M cycles, ~10 ms): true when no barrier timed out. (A grid that is not resident never passes a barrier: every read would
+// time out, so the answer is not a matter of timing.) Uses the scratch's second counter; the caller zeroes the counters after it.
+// (the probe's buffers and stream are a struct of their own, HcProbeBuf, so that a caller that holds another kernel resident
+// through the probe can allocate before and free after: cudaFree waits for the whole card.)
+struct HcProbeBuf {
+    std::vector<void*> p;
+    cudaStream_t st = nullptr;
+    float *R = nullptr, *w_norm = nullptr, *mixed = nullptr, *inject = nullptr;
+    Q8S down, up;
+    uint16_t* w_inj = nullptr;
+    unsigned* err = nullptr;
+    void* dz(size_t bytes) {
+        void* q = nullptr;
+        if (cudaMalloc(&q, bytes) != cudaSuccess) throw std::runtime_error("hc_probe: no memory for the probe");
+        p.push_back(q);
+        if (cudaMemset(q, 0, bytes) != cudaSuccess) throw std::runtime_error("hc_probe: the probe's buffers could not be zeroed");
+        return q;
+    }
+    HcProbeBuf() {
+        try {
+            R = (float*) dz((size_t) MAXT * D * 4);
+            w_norm = (float*) dz((size_t) D * 4);
+            down.q = (int8_t*) dz((size_t) LR * D), down.d = (uint16_t*) dz((size_t) LR * D / 16);
+            up.q = (int8_t*) dz((size_t) D * LR), up.d = (uint16_t*) dz((size_t) D * LR / 16);
+            w_inj = (uint16_t*) dz((size_t) HC * D * 2);
+            mixed = (float*) dz((size_t) MAXT * N * 4);
+            inject = (float*) dz((size_t) MAXT * HC * 4);
+            err = (unsigned*) dz(ERR_WORDS * sizeof(unsigned));   // a block: a barrier that times out here writes its record (diag.cuh)
+            if (cudaStreamCreate(&st) != cudaSuccess) throw std::runtime_error("hc_probe: no stream");
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+    void release() {
+        if (st) cudaStreamDestroy(st);
+        st = nullptr;
+        for (void* q : p) cudaFree(q);
+        p.clear();
+    }
+    ~HcProbeBuf() { release(); }
+    HcProbeBuf(const HcProbeBuf&) = delete;
+    HcProbeBuf& operator=(const HcProbeBuf&) = delete;
+    // the scratch's two barrier counters to zero, on the probe's stream
+    void zero_counters(float* scratch) {
+        if (cudaMemsetAsync(scratch + hc_scratch_floats(MAXT) - 2, 0, 2 * sizeof(unsigned), st) != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess)
+            throw std::runtime_error("hc_probe: the barrier counters could not be zeroed");
+    }
+    // held: another kernel stays resident through the probe (mall_pf_hc_probe): err is zeroed first (a second run) and the result is read on the
+    // probe's stream, not with a call on the null stream. Not held: hc_prepare's probe, the calls it always made.
+    // (pinned: a pinned host word for the held form's result)
+    bool run(float* scratch, int grid, bool held, unsigned* pinned = nullptr) {
+        if (held && (!pinned || cudaMemsetAsync(err, 0, ERR_WORDS * sizeof(unsigned), st) != cudaSuccess)) return false;
+        const auto args = [&](int T) {
+            HcArgs a{R, nullptr, nullptr, w_norm, down, up, w_inj, 1e-6f, mixed, inject, nullptr, nullptr, nullptr, nullptr, nullptr, err, nullptr};
+            a.part = scratch;
+            a.ssp = a.part + (size_t) H_NS * T * H_ROWS;
+            a.loq = (int8_t*) (a.ssp + (size_t) T * H_NS);
+            a.lod = a.ssp + (size_t) T * H_NS + (size_t) T * LR / 4;
+            a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - 2);
+            a.timeout = 20000000LL;
+            return a;
+        };
+        k_hc<MAXT, false, true><<<grid, H_DT, 0, st>>>(args(MAXT));
+        k_hc<8, true, true><<<grid, H_DT, 0, st>>>(args(8));
+        k_hc<4, false, true><<<grid, H_DT, 0, st>>>(args(4));
+        k_hc<4, true, true><<<grid, H_DT, 0, st>>>(args(4));
+        unsigned e = 1;
+        if (held) {
+            *pinned = 1;
+            const bool ran = cudaGetLastError() == cudaSuccess && cudaMemcpyAsync(pinned, err, sizeof e, cudaMemcpyDeviceToHost, st) == cudaSuccess &&
+                             cudaStreamSynchronize(st) == cudaSuccess;
+            return ran && *pinned == 0;
+        }
+        const bool ran = cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(st) == cudaSuccess &&
+                         cudaMemcpy(&e, err, sizeof e, cudaMemcpyDeviceToHost) == cudaSuccess;
+        return ran && e == 0;
+    }
+};
+bool hc_probe(float* scratch, int grid) {
+    HcProbeBuf buf;
+    return buf.run(scratch, grid, false);
 }
 
 int hc_prepare(float* scratch, int cap) {
@@ -1184,27 +1494,142 @@ int hc_prepare(float* scratch, int cap) {
     if (const long long g = env_int("FNX_HC_GRID", 0); g > 0) hc_grid_[dev] = (int) std::min<long long>(g, cap ? cap : H_BLOCKS);
 #endif
     // a counter left by another grid sits mid-generation for this one: its next barrier would let blocks through early
-    const unsigned zero = 0;
-    const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &zero, sizeof zero, cudaMemcpyHostToDevice);
-    if (z != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: the barrier counter: ") + cudaGetErrorString(z));
+    const unsigned zero[2] = {0, 0};
+    const auto zero_counters = [&] {
+        const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 2, zero, sizeof zero, cudaMemcpyHostToDevice);
+        if (z != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: the barrier counters: ") + cudaGetErrorString(z));
+    };
+    zero_counters();
+    hc_grid_big_[dev] = 0;
+#if FNX_MM_HC && FNX_HIP
+    {
+        if (!hc_mm_q_[dev] && cudaMalloc((void**) &hc_mm_q_[dev], HM_Q * sizeof(unsigned)) != cudaSuccess) {
+            hc_mm_q_[dev] = nullptr;
+            throw std::runtime_error("hc_prepare: no memory for the read's ticket queue");
+        }
+        if (cudaMemset(hc_mm_q_[dev], 0, HM_Q * sizeof(unsigned)) != cudaSuccess) throw std::runtime_error("hc_prepare: the ticket queue could not be zeroed");
+    }
+#endif
+#if FNX_HIP
+    if (!cap && env_int("FNX_HC_GRID", 0) <= 0 && fast_opt("FNX_HC_GRID2")) {
+        static const long long big = env_int("FNX_HC_GRID2_BLOCKS", 48);   // once per process: a counter counts in generations of one grid
+        if (big > hc_grid_[dev] && big < H_BLOCKS) {
+            if (hc_probe(scratch, (int) big)) hc_grid_big_[dev] = (int) big;
+            else std::fprintf(stderr, "fnx: card %d: a grid of %lld blocks of the hc read was not resident: reads of every width keep %d\n", dev, big, hc_grid_[dev]);
+            zero_counters();
+        }
+    }
+#endif
     return hc_grid_[dev];
 }
 
 void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
              const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
-             void* q8) {
+             void* q8
+#if FNX_MALL_PF
+             ,
+             unsigned* pf_word
+#endif
+             ,
+             const HcSumReq* sum) {
+    if (sum) {   // the window's sum of bo first: as this read's first tickets where its kernel takes them, else a launch of its own
+        bool fold = false;
+#if FNX_MM_HC && FNX_HIP
+        static const tk::Family* const tkf0 = tk::family("hc_mm");
+        const Ring& sr = *sum->ring;
+        fold = mm_hc() && !tkf0 && bo && sum->x == bo && sr.onehop && !sr.peer && !sr.f32 && T >= 1 && T <= MAXT && T <= sr.rows && T <= hc_sum_rows()
+               && ((uintptr_t) sum->x & 63) == 0;   // (a sum ticket's 2048 bytes of x are whole cache lines: no block loads a line another block's ticket stores)
+#endif
+        if (!fold) {
+            ring_sum(*sum->ring, sum->x, T, sum->tag, sum->call, st, sum->m);
+            sum = nullptr;
+        }
+    }
     HcArgs a{R, bo, inj_prev, w_norm, w_down, w_up, w_inj, eps, mixed, inject, nullptr, nullptr, nullptr, nullptr, nullptr, err,
              (block_q8_1*) q8};
+#if FNX_MALL_PF
+    a.pf = pf_word;
+#endif
+    // FNX_HC_TIMEOUT_CYCLES: the hc read's barrier / gate time-out in clock64 cycles (unset: HcArgs' 2,000,000,000, as before)
+    static const long long hc_timeout = env_int("FNX_HC_TIMEOUT_CYCLES", 0);
+    if (hc_timeout < 0) throw std::runtime_error("FNX_HC_TIMEOUT_CYCLES: want a number of cycles > 0");
+    if (hc_timeout > 0) a.timeout = hc_timeout;
     a.part = scratch;
     a.ssp = a.part + (size_t) H_NS * T * H_ROWS;
     a.loq = (int8_t*) (a.ssp + (size_t) T * H_NS);
     a.lod = a.ssp + (size_t) T * H_NS + (size_t) T * LR / 4;
-    // the barrier's counter: the last float of a scratch sized for MAXT rows, so it stays put whatever T is
-    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - 1);
+    // the barrier's counter: the last float of a scratch sized for MAXT rows, so it stays put whatever T is (the one before it: the second grid's)
+    const int dev_big = hc_grid_big_[hc_dev()];
+    const bool use_big = dev_big > 0 && T >= HC_BIG_ROWS;
+    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - (use_big ? 2 : 1));
+#if FNX_KBENCH
+    a.stub = hc_stub_;
+#endif
     if (q8) twin_of(q8, N, a.tq, a.td);
     cudaStream_t s = (cudaStream_t) st;
+#if FNX_MM_HC && FNX_HIP
+    if (mm_hc()) {   // the ticket queue (no barrier, no grid to be resident)
+        unsigned* const q = hc_mm_q_[hc_dev()];
+        if (!q) throw std::runtime_error("hc_read: hc_prepare was not run on this card (the ticket queue)");
+        const int mg = hc_mm_grid();
+        if (sum) {
+            const HmRingSum sm{*sum->ring, sum->x, sum->tag, sum->call, sum->m};
+#define FNX_HCMS(t) k_hc_mm_sum<t><<<mg, HM_T, 0, s>>>(a, q, sm)
+            switch (T) {
+                case 1: FNX_HCMS(1); break;
+                case 2: FNX_HCMS(2); break;
+                case 3: FNX_HCMS(3); break;
+                case 4: FNX_HCMS(4); break;
+                case 5: FNX_HCMS(5); break;
+                case 6: FNX_HCMS(6); break;
+                case 7: FNX_HCMS(7); break;
+                case 8: FNX_HCMS(8); break;
+                case 9: FNX_HCMS(9); break;
+                case 10: FNX_HCMS(10); break;
+                case 11: FNX_HCMS(11); break;
+                case 12: FNX_HCMS(12); break;
+                case 13: FNX_HCMS(13); break;
+                case 14: FNX_HCMS(14); break;
+                case 15: FNX_HCMS(15); break;
+                case 16: FNX_HCMS(16); break;
+                default: throw std::runtime_error("hc_read: T out of range");
+            }
+#undef FNX_HCMS
+            ck_launch("hc_read (with the sum)");
+            return;
+        }
+#define FNX_HCM(t) k_hc_mm<t><<<mg, HM_T, 0, s>>>(a, q)
+        static const tk::Family* const tkf = tk::family("hc_mm");   // the generator's variant: a kernel per row count
+        if (tkf) {
+            const tk::Kern& k = tkf->kern(T);
+            FNX_TK_LAUNCH(k, k_hc_mm<1>, dim3(mg), dim3(k.threads), 0, s, a, q);
+        } else
+        switch (T) {
+            case 1: FNX_HCM(1); break;
+            case 2: FNX_HCM(2); break;
+            case 3: FNX_HCM(3); break;
+            case 4: FNX_HCM(4); break;
+            case 5: FNX_HCM(5); break;
+            case 6: FNX_HCM(6); break;
+            case 7: FNX_HCM(7); break;
+            case 8: FNX_HCM(8); break;
+            case 9: FNX_HCM(9); break;
+            case 10: FNX_HCM(10); break;
+            case 11: FNX_HCM(11); break;
+            case 12: FNX_HCM(12); break;
+            case 13: FNX_HCM(13); break;
+            case 14: FNX_HCM(14); break;
+            case 15: FNX_HCM(15); break;
+            case 16: FNX_HCM(16); break;
+            default: throw std::runtime_error("hc_read: T out of range");
+        }
+#undef FNX_HCM
+        ck_launch("hc_read");
+        return;
+    }
+#endif
     const bool one = T <= hc1_rows();
-    const int grid = hc_grid();
+    const int grid = use_big ? dev_big : hc_grid();
     switch (T) {
         case 1: hc_launch<1>(a, s, one, grid); break;
         case 2: hc_launch<2>(a, s, one, grid); break;
@@ -1225,6 +1650,107 @@ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_no
         default: throw std::runtime_error("hc_read: T out of range");
     }
     ck_launch("hc_read");
+}
+
+// the grid a read of T rows takes on the current card
+int hc_grid_for(int T) {
+    const int big = hc_grid_big_[hc_dev()];
+    return big > 0 && T >= HC_BIG_ROWS ? big : hc_grid();
+}
+
+// are the hc read's grids in use on the current card resident beside `wgs` resident workgroups of the persistent cache prefetcher?
+// hc_prepare's probe ran with the card to itself. Here an idle prefetcher (k_mall_pf_run on `side`: it polls a count that does not move) is held
+// resident, each grid in use is probed again (HcProbeBuf::run), and the stop word ends the prefetcher. The card must be idle; `work` is an idle
+// stream of the card for the few small kernels and copies (no call here but the last frees waits for the whole card: cudaFree does, so the probe's
+// buffers are allocated before the prefetcher starts and freed after it ended). Returns 0: resident; bit 0: the card's grid is not, bit 1: the
+// larger grid is not, bit 2: the probe says nothing (the prefetcher's blocks were not all resident in time, or it ended before the probe did).
+// Leaves the barrier counters and the words at zero.
+// (second form, after the first gave no answer on the card: the words are read and the stop is written by kernels of the card at device scope
+// (mall_pf_peek / mall_pf_poke), as the prefetcher reads and writes them, not by host copies; the wait for the blocks is 250 ms of wall time, not a
+// number of reads; `info` says which step failed and how long each took. `work` and the probe's own stream must not share the prefetcher's
+// hardware queue (mall_pf_stream): a launch on a shared queue waits for the prefetcher's end, that is for its time-out.)
+int mall_pf_hc_probe(float* scratch, const PfSet* table, int n, unsigned* words, int wgs, void* side, void* work, PfProbeInfo* info, bool query) {
+    const int dev = hc_dev();
+    cudaStream_t ws = (cudaStream_t) work, ss = (cudaStream_t) side;
+    HcProbeBuf buf;
+    unsigned* out = (unsigned*) buf.dz(4 * sizeof(unsigned));   // mall_pf_peek's word
+    const auto ok = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) throw std::runtime_error(std::string("mall_pf_hc_probe: ") + what + ": " + cudaGetErrorString(e));
+    };
+    struct Pinned {   // two pinned host words: the small copies' and the probes' result
+        unsigned* v = nullptr;
+        ~Pinned() {
+            if (v) cudaFreeHost(v);
+        }
+    } hw;
+    ok(cudaMallocHost((void**) &hw.v, 2 * sizeof(unsigned)), "pinned words");
+    using clk = std::chrono::steady_clock;
+    const auto ms_since = [](clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); };
+    const auto get = [&](int idx) {   // words[idx] by a device-scope load of a kernel on the work stream, then that kernel's word
+        hw.v[0] = 0;
+        mall_pf_peek(words, idx, out, ws);
+        ok(cudaMemcpyAsync(hw.v, out, sizeof(unsigned), cudaMemcpyDeviceToHost, ws), "read");
+        ok(cudaStreamSynchronize(ws), "read sync");
+        return hw.v[0];
+    };
+    const auto wipe = [&] {
+        ok(cudaMemsetAsync(words, 0, MALL_PF_WORDS * sizeof(unsigned), ws), "words");
+        ok(cudaStreamSynchronize(ws), "words sync");
+    };
+    wipe();
+    buf.zero_counters(scratch);
+    PfRun idle;
+    idle.sets = table, idle.words = words, idle.n = n, idle.base = 0x40000000u, idle.timeout = mall_pf_ticks(4000.0);
+    mall_pf_run(idle, wgs, side, query);
+    int bad = 0;
+    PfProbeInfo pi;
+    bool up = false;   // every block of the prefetcher adds one to words[4] when it starts
+    const auto t0 = clk::now();
+    do {
+        pi.started = get(4);
+        ++pi.reads;
+        up = pi.started >= (unsigned) wgs;
+    } while (!up && ms_since(t0) < 250.0);
+    pi.ms_up = ms_since(t0);
+    const auto t1 = clk::now();
+    if (up) {
+        if (!buf.run(scratch, hc_grid(), true, hw.v + 1)) bad |= 1;
+        buf.zero_counters(scratch);
+        if (hc_grid_big_[dev] > 0 && !buf.run(scratch, hc_grid_big_[dev], true, hw.v + 1)) bad |= 2;
+    } else
+        bad |= 4;
+    pi.ms_probe = ms_since(t1);
+    const auto t2 = clk::now();
+    mall_pf_poke(words, 3, 1u, ws);
+    ok(cudaStreamSynchronize(ws), "stop sync");
+    ok(cudaStreamSynchronize(ss), "prefetcher sync");
+    pi.ms_stop = ms_since(t2);
+    pi.status = get(1);
+    if (pi.status & 1u) bad |= 4;   // it timed out before the stop: it was not resident through the probe
+    wipe();
+    buf.zero_counters(scratch);
+    if (info) *info = pi;
+    return bad;
+}
+
+std::string mall_pf_probe_text(int bad, const PfProbeInfo& pi, int wgs) {
+    char t[512];
+    std::string s = bad == 0 ? " the hc read's grids are resident;" : "";
+    if (bad & 1) s += " the hc read's grid is NOT resident;";
+    if (bad & 2) s += " the hc read's larger grid is NOT resident;";
+    if (bad & 4) {
+        if (pi.started < (unsigned) wgs)
+            std::snprintf(t, sizeof t, " no answer: %u of %d prefetcher blocks had started after %.0f ms (%d reads);", pi.started, wgs, pi.ms_up, pi.reads);
+        else
+            std::snprintf(t, sizeof t, " no answer: the idle prefetcher timed out before its stop (status %u);", pi.status);
+        s += t;
+        if (pi.ms_up > 1000.0 || pi.ms_probe > 1000.0)
+            s += " a step took over a second: possibly a launch that waited for the prefetcher's end on a shared hardware queue (mall_pf_stream);";
+        else if (pi.ms_stop > 1000.0)
+            s += " the stop took over a second: the stop kernel ran late or the prefetcher did not see its word;";
+    }
+    std::snprintf(t, sizeof t, " (blocks up in %.2f ms and %d reads, probes %.1f ms, stop to end %.2f ms)", pi.ms_up, pi.reads, pi.ms_probe, pi.ms_stop);
+    return s + t;
 }
 
 void hc_preset_barrier(float* scratch, unsigned barriers_left) {
@@ -1280,8 +1806,14 @@ void gdn_out_norm(const float* o, const float* z, const float* w, float* y, int 
 #if FNX_KPART == 5
 void attn_prep(float* qg, float* k, const float* q_norm, const float* k_norm, int nq, int nkv, const int* pos0, int T, float eps,
                Rope base, void* st) {
-    k_attn_prep<<<dim3(nq + nkv, T), HD, 0, (cudaStream_t) st>>>(qg, k, q_norm, k_norm, nq, nkv, pos0, eps, base);
+    k_attn_prep<<<dim3(nq + nkv, T), HD, 0, (cudaStream_t) st>>>(qg, k, q_norm, k_norm, nq, nkv, pos0, eps, base, LaneRows{});
     ck_launch("attn_prep");
+}
+void attn_prep_lanes(float* qg, float* k, const float* q_norm, const float* k_norm, int nq, int nkv, const LaneRows& lr, int T, float eps,
+                     Rope base, void* st) {
+    if (!lr.pos || !lr.tab) throw std::runtime_error("attn_prep_lanes: no lane rows");
+    k_attn_prep<<<dim3(nq + nkv, T), HD, 0, (cudaStream_t) st>>>(qg, k, q_norm, k_norm, nq, nkv, nullptr, eps, base, lr);
+    ck_launch("attn_prep_lanes");
 }
 int qsa_maxsel() { return QSA_MAXSEL; }
 // the raw-key ring holds a prompt chunk and the block before it (positions mod its rows): twice the chunk, 2048 at least
@@ -1289,6 +1821,56 @@ namespace {
 int qsa_ring = 2048;
 }
 int qsa_ring_rows() { return qsa_ring; }
+
+#if FNX_ATT_MM
+// (attn_mm.cuh): FNX_ATT_MM=0 runs the kernels of a build without the option; kbench switches with att_mm_force
+namespace {
+int g_att_mm_force = -1;
+bool att_mm_on() {
+    static const bool env = env_int("FNX_ATT_MM", 1) != 0;
+    return g_att_mm_force >= 0 ? g_att_mm_force != 0 : env;
+}
+// the attention part by k_attn_mm: int8 pages only. FNX_KV8=0 (the engine's f16 pages) keeps k_attn_part; the choice is the process's (kv_q8), so
+// that attn_part_lanes and attn_finish agree, and pages of the other kind than kv_q8 says are refused (att_mm_pages)
+bool att_mm_attn() { return att_mm_on() && kv_q8(); }
+// its splits of a row: FNX_ATT_MM_SPLITS (default 8), the same for every window, so that a row's sums do not depend on the other rows of its
+// window: a sequence's greedy text is then the same alone and in a batch (2026-11-14: with the count by the rows, 4..16, the 4-user texts of
+// agree.py differed from the 1-user texts; 8 and 16 give equal texts, and 8 costs the least over 1..16 rows). 0: by the rows (about a block a
+// compute unit; up to 5 us a layer faster under 5 rows, but batch-dependent sums)
+int att_mm_splits(int T) {
+    static const long long env = env_int("FNX_ATT_MM_SPLITS", std::min(8, ATT_SPLITS));   // (ATT_SPLITS: the partials' slots a head; a build with fewer than 8 takes them all)
+    if (env < 0 || env > ATT_SPLITS) throw std::runtime_error("FNX_ATT_MM_SPLITS: 0 (by the rows) or 1.." + std::to_string(ATT_SPLITS));
+    return env ? (int) env : std::min(std::min(16, ATT_SPLITS), std::max(4, 64 / std::max(T, 1)));
+}
+// FNX_ATT_MM_SCORE_TC=1: one sequence's window scores its blocks with the prompt path's matrix-product kernel (k_idx_score_tc: f16 products, the
+// scores differ from k_idx_score's in the last bits, so a near tie can select another block). Default 0: k_idx_score_mm, the same bits
+bool att_mm_score_tc() {
+    static const bool env = env_int("FNX_ATT_MM_SCORE_TC", 0) != 0;
+    return env;
+}
+void att_mm_pages(const KvPages& g, const char* who) {
+    if (!g.q8 || g.rows != AM_PROWS) throw std::runtime_error(std::string(who) + ": FNX_ATT_MM reads int8 pages of " + std::to_string(AM_PROWS) + " rows");
+}
+}  // namespace
+void att_mm_force(int on) { g_att_mm_force = on; }
+#if FNX_KBENCH
+void kb_idx_score(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int max_pools, const int* pos0, int T, int mm, void* st) {
+    cudaStream_t s = (cudaStream_t) st;
+    const __half* pl = reinterpret_cast<const __half*>(pooled);
+    if (mm == 2)   // the prompt path's scorer on the window's rows (FNX_ATT_MM_SCORE_TC)
+        k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
+    else if (mm) k_idx_score_mm<8><<<dim3((max_pools + 255) / 256, (T + 7) / 8), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{}, T);
+    else k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
+    ck_launch("kb_idx_score");
+}
+void kb_idx_select(const float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T, int card, int mm, void* st) {
+    cudaStream_t s = (cudaStream_t) st;
+    if (mm) k_idx_select_mm<<<T, QS_NT, 0, s>>>(scores, cells, n_cells, max_pools, pos0, LaneRows{});
+    else k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+    ck_launch("kb_idx_select");
+}
+#endif
+#endif
 void set_prompt_rows(int rows) { qsa_ring = std::max(2048, 2 * rows); }
 
 void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring, uint16_t* pooled, const KvPages& g, float* q, const int* pos0, int T,
@@ -1297,17 +1879,88 @@ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring,
     if (T + QSA_POOL - 1 > qsa_ring) throw std::runtime_error("qsa_index: more rows than the raw-key ring holds");
     __half* r = reinterpret_cast<__half*>(ring);
     __half* pl = reinterpret_cast<__half*>(pooled);
-    k_idx_prep<<<dim3(T, QSA_HEADS + 1), QSA_DIM, 0, s>>>(y, qn, r, qsa_ring, q, pos0, eps, base);
-    k_idx_pool<<<T, QSA_DIM, 0, s>>>(r, qsa_ring, kn, pl, g, pos0, eps, base);
+    k_idx_prep<<<dim3(T, QSA_HEADS + 1), QSA_DIM, 0, s>>>(y, qn, r, qsa_ring, q, pos0, eps, base, LaneRows{});
+    k_idx_pool<<<T, QSA_DIM, 0, s>>>(r, qsa_ring, kn, pl, g, pos0, eps, base, LaneRows{});
     ck_launch("qsa_index");
+}
+
+void qsa_index_lanes(const float* y, const float* qn, const float* kn, uint16_t* pooled, const KvPages& g, float* q, const LaneRows& lr, int T,
+                     float eps, Rope base, void* st) {
+    cudaStream_t s = (cudaStream_t) st;
+    if (!lr.pos || !lr.pt || !lr.tab || !lr.ring) throw std::runtime_error("qsa_index_lanes: no lane rows");
+    if (T + QSA_POOL - 1 > qsa_ring) throw std::runtime_error("qsa_index_lanes: more rows than the raw-key ring holds");
+    __half* pl = reinterpret_cast<__half*>(pooled);
+    k_idx_prep<<<dim3(T, QSA_HEADS + 1), QSA_DIM, 0, s>>>(y, qn, nullptr, qsa_ring, q, nullptr, eps, base, lr);
+    k_idx_pool<<<T, QSA_DIM, 0, s>>>(nullptr, qsa_ring, kn, pl, g, nullptr, eps, base, lr);
+    ck_launch("qsa_index_lanes");
 }
 
 void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
                 int card, void* st) {
     cudaStream_t s = (cudaStream_t) st;
     const __half* pl = reinterpret_cast<const __half*>(pooled);
-    k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools,
-                                                                                                         pos0, T);
+#if FNX_ATT_MM
+    // FNX_PF_SCORE_RT = TOK (0, 32 or 64; default 32: +7.8 % read rate at 127K): k_idx_score_rt<TOK>, the same scores with TOK rows a block over FNX_PF_SCORE_KR keys (default 256)
+    static const int rt = (int) env_int("FNX_PF_SCORE_RT", 32), kr = std::max(16, (int) env_int("FNX_PF_SCORE_KR", 256)) / 16 * 16;
+    if (rt && att_mm_on()) {
+        if (rt != 32 && rt != 64) throw std::runtime_error("FNX_PF_SCORE_RT: 0, 32 or 64");
+        if (rt == 32) k_idx_score_rt<32><<<dim3((max_pools + kr - 1) / kr, (T + 31) / 32), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T, kr);
+        else k_idx_score_rt<64><<<dim3((max_pools + kr - 1) / kr, (T + 63) / 64), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T, kr);
+        static const int check = (int) env_int("FNX_PF_SCORE_CHECK", 0);   // debug, syncs: the first N calls against k_idx_score_tc
+        if (check > 0) {
+            // scratch a device (the cards' workers run at once), the count under a lock
+            struct Scratch { float* ref = nullptr; unsigned* bad = nullptr; size_t cap = 0; };
+            static Scratch sc[16];
+            static std::mutex mu;
+            static int checked = 0;
+            int dev = 0;
+            cudaGetDevice(&dev);
+            if (dev < 0 || dev >= 16) throw std::runtime_error("FNX_PF_SCORE_CHECK: device");
+            bool go;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                go = checked < check;
+            }
+            if (go) {
+                Scratch& x = sc[dev];
+                const size_t need = (size_t) T * max_pools;
+                if (need > x.cap) {
+                    if (x.ref) cudaFree(x.ref);
+                    if (cudaMalloc(&x.ref, need * sizeof(float)) != cudaSuccess) throw std::runtime_error("FNX_PF_SCORE_CHECK: scratch");
+                    x.cap = need;
+                }
+                if (!x.bad && cudaMalloc(&x.bad, sizeof(unsigned)) != cudaSuccess) throw std::runtime_error("FNX_PF_SCORE_CHECK: scratch");
+                k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, x.ref, max_pools,
+                                                                                                                     pos0, T);
+                cudaMemsetAsync(x.bad, 0, sizeof(unsigned), s);
+                k_score_cmp<<<dim3(32, T), 256, 0, s>>>(scores, x.ref, max_pools, pos0, T, x.bad);
+                if (cudaStreamSynchronize(s) != cudaSuccess) throw std::runtime_error("FNX_PF_SCORE_CHECK: sync");
+                unsigned nb = 0;
+                int p0 = 0;
+                if (cudaMemcpy(&nb, x.bad, sizeof(unsigned), cudaMemcpyDeviceToHost) != cudaSuccess ||
+                    cudaMemcpy(&p0, pos0, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) throw std::runtime_error("FNX_PF_SCORE_CHECK: copy");
+                if ((p0 + T) / QSA_POOL > QSA_TOP) {   // calls with a row past QSA_TOP blocks only (k_score_cmp's rows)
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (checked < check) {
+                        ++checked;
+                        fprintf(stderr, "fnx: score check (rt %d, kr %d, card %d, pos0 %d, rows %d): %u scores differ\n", rt, kr, dev, p0, T, nb);
+                    }
+                }
+            }
+        }
+    } else
+#endif
+    k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
+    // FNX_PF_SEL_MM (default 1 when FNX_ATT_MM is on): k_idx_select_mm's sampled threshold, the same list as k_idx_select's bit for bit
+    // (by heads every block is this card's); 0: k_idx_select's radix select over every score
+#if FNX_ATT_MM
+    static const bool sel_mm = env_int("FNX_PF_SEL_MM", 1) != 0;
+    if (sel_mm && att_mm_on()) {   // FNX_ATT_MM=0 keeps every original kernel (model.hpp)
+        k_idx_select_mm<<<T, QS_NT, 0, s>>>(scores, cells, n_cells, max_pools, pos0, LaneRows{});
+        ck_launch("qsa_select");
+        return;
+    }
+#endif
     k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
     ck_launch("qsa_select");
 }
@@ -1323,6 +1976,14 @@ void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, 
         return;
     }
     const __half* pl = reinterpret_cast<const __half*>(pooled);
+#if FNX_ATT_MM
+    if (att_mm_on()) {   // a page table per row: a block of scores per row
+        k_idx_score_mm<8><<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, nullptr, lr, T);
+        k_idx_select_mm<<<T, QS_NT, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, lr);
+        ck_launch("qsa_select_lanes");
+        return;
+    }
+#endif
     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, nullptr, lr);
     k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
     ck_launch("qsa_select_lanes");
@@ -1372,61 +2033,164 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
         ck_launch("qsa");
         return;
     }
+#if FNX_ATT_MM
+    if (att_mm_on()) {
+        if (att_mm_score_tc())
+            k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
+        else k_idx_score_mm<8><<<dim3((max_pools + 255) / 256, (T + 7) / 8), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{}, T);
+        if (g_kprof_dev >= 0) kprof_mark("qsa prep+score");
+        k_idx_select_mm<<<T, QS_NT, 0, s>>>(scores, cells, n_cells, max_pools, pos0, LaneRows{});
+        ck_launch(g_kprof_dev >= 0 ? "qsa select" : "qsa");
+        return;
+    }
+#endif
     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
     k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
     ck_launch("qsa");
 }
 
-size_t attn_scratch_floats(int) { return (size_t) ATT_ROWS * NQH * ATT_SPLITS * (HD + 2) + (size_t) ATT_ROWS * NQH * (HD + 2); }
+size_t attn_scratch_floats(int) { return (size_t) ATT_ROWS * NQH_LOC * ATT_SPLITS * (HD + 2) + (size_t) ATT_ROWS * NQH_LOC * (HD + 2); }
 size_t att_ring_words() { return (size_t) 2 * (NCARD - 1) * ATT_ROWS * ATT_OWN * (HD + 2); }
 int attn_rows() { return ATT_ROWS; }
-int kv_rows_per_card(int n_ctx) { return (n_ctx / 4 + NCARD - 1) / NCARD * 4 + 4; }
+int kv_rows_per_card(int n_ctx) { return ATT_HEADS ? n_ctx / 4 * 4 + 4 : (n_ctx / 4 + NCARD - 1) / NCARD * 4 + 4; }
 
+// xq (attn, attn_finish): the output also as q8_1 rows, NQH_LOC * HD values a row. The combine kernel writes them itself (FNX_ATT_Q8, on in an APPROX build; 0 or
+// another path: quantize_q8_1 after it, as before)
+static bool att_q8_fused() {
+    static const bool on = env_int("FNX_ATT_Q8", APPROX) != 0;
+    return on;
+}
 void attn(const float* qg, const uint16_t* kc16, const uint16_t* vc16, const KvPages& g, float* out, const AttRing& ar, const unsigned* tag,
-          int call, const int* pos0, int T, float* scratch, void* st, const int* cells, const int* n_cells) {
+          int call, const int* pos0, int T, float* scratch, void* st, const int* cells, const int* n_cells, void* xq) {
     ring_call_check(call, "attn");
     float* acc = scratch;
     if (T > ATT_ROWS) throw std::runtime_error("attn: more rows than its buffers hold");
-    AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * HD);
-    float* part = scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * (HD + 2);
+    AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH_LOC * ATT_SPLITS * HD);
+    float* part = scratch + (size_t) ATT_ROWS * NQH_LOC * ATT_SPLITS * (HD + 2);
     const __half* kc = reinterpret_cast<const __half*>(kc16);
     const __half* vc = reinterpret_cast<const __half*>(vc16);
     cudaStream_t s = (cudaStream_t) st;
-    k_attn_part<<<dim3(ATT_SPLITS, T, NKVH), HD, 0, s>>>(qg, kc, vc, g, acc, mz, NQH, 0, NKVH, 0, pos0, cells, n_cells, ar.card, LaneRows{});
+#if FNX_ATT_MM
+    if (att_mm_attn()) {
+        att_mm_pages(g, "attn");
+        const int S = att_mm_splits(T);
+        k_attn_mm<<<dim3(S, T), 256, 0, s>>>(qg, reinterpret_cast<const uint8_t*>(kc16), reinterpret_cast<const uint8_t*>(vc16), g, acc, mz, pos0, cells,
+                                             n_cells, LaneRows{}, S);
+        if (g_kprof_dev >= 0) kprof_mark("attn part");
+        int8_t* tq = nullptr;
+        float* td = nullptr;
+        const bool fq = xq && att_q8_fused();
+        if (fq) twin_of(xq, NQH_LOC * HD, tq, td);
+        k_attn_combine_n<<<dim3(NQH_LOC, T), HD, 0, s>>>(qg, acc, mz, out, NQH_LOC, S, fq ? (block_q8_1*) xq : nullptr, tq, td);
+        ck_launch(g_kprof_dev >= 0 ? "attn combine" : "attn");
+        if (xq && !fq) quantize_q8_1(out, xq, NQH_LOC * HD, T, st);
+        (void) part, (void) tag, (void) kc, (void) vc;
+        return;
+    }
+#endif
+    k_attn_part<<<dim3(ATT_SPLITS, T, KVH_LOC), HD, 0, s>>>(qg, kc, vc, g, acc, mz, NQH_LOC, 0, KVH_LOC, 0, pos0, cells, n_cells, ar.card,
+                                                            LaneRows{});
+    if (g_kprof_dev >= 0) kprof_mark("attn part");
+    if constexpr (ATT_HEADS) {   // by heads: this card's splits are every position of its heads; combined and gated here
+        k_attn_combine<<<dim3(NQH_LOC, T), HD, 0, s>>>(qg, acc, mz, out, NQH_LOC);
+        ck_launch(g_kprof_dev >= 0 ? "attn combine" : "attn");
+        if (xq) quantize_q8_1(out, xq, NQH_LOC * HD, T, st);
+        (void) part, (void) tag;
+        return;
+    }   // FNX_KPROF: the three kernels one by one
     k_attn_local<<<dim3(NQH, T), HD, 0, s>>>(acc, mz, part);
+    if (g_kprof_dev >= 0) kprof_mark("attn local");
     if (ar.onehop) k_att_merge_a2a<<<dim3(ATT_OWN, T), HD, 0, s>>>(ar, qg, part, out, T, tag, call);
     else k_att_merge<<<dim3(ATT_OWN, T), HD, 0, s>>>(ar, qg, part, out, T, tag, call);
-    ck_launch("attn");
+    ck_launch(g_kprof_dev >= 0 ? "attn merge" : "attn");
+    if (xq) quantize_q8_1(out, xq, NQH_LOC * HD, T, st);
 }
 
 void attn_part_lanes(const float* qg, const uint16_t* kc16, const uint16_t* vc16, const KvPages& g, const LaneRows& lr, int T,
                      float* scratch, void* st, const int* cells, const int* n_cells, int card) {
     if (T > ATT_ROWS) throw std::runtime_error("attn: more rows than its buffers hold");
     if (!lr.pos || !lr.pt) throw std::runtime_error("attn_part_lanes: no lane rows");
-    AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * HD);
-    k_attn_part<<<dim3(ATT_SPLITS, T, NKVH), HD, 0, (cudaStream_t) st>>>(qg, reinterpret_cast<const __half*>(kc16),
-                                                                       reinterpret_cast<const __half*>(vc16), g, scratch, mz, NQH, 0,
-                                                                       NKVH, 0, nullptr, cells, n_cells, card, lr);
+    AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH_LOC * ATT_SPLITS * HD);
+#if FNX_ATT_MM
+    if (att_mm_attn()) {   // attn_finish combines the same splits
+        att_mm_pages(g, "attn_part_lanes");
+        const int S = att_mm_splits(T);
+        k_attn_mm<<<dim3(S, T), 256, 0, (cudaStream_t) st>>>(qg, reinterpret_cast<const uint8_t*>(kc16), reinterpret_cast<const uint8_t*>(vc16), g, scratch,
+                                                             mz, nullptr, cells, n_cells, lr, S);
+        ck_launch("attn lanes");
+        (void) card;
+        return;
+    }
+#endif
+    k_attn_part<<<dim3(ATT_SPLITS, T, KVH_LOC), HD, 0, (cudaStream_t) st>>>(qg, reinterpret_cast<const __half*>(kc16),
+                                                                          reinterpret_cast<const __half*>(vc16), g, scratch, mz, NQH_LOC, 0,
+                                                                          KVH_LOC, 0, nullptr, cells, n_cells, card, lr);
     ck_launch("attn lanes");
 }
 
-void attn_finish(const float* qg, float* out, const AttRing& ar, const unsigned* tag, int call, int T, float* scratch, void* st) {
+void attn_finish(const float* qg, float* out, const AttRing& ar, const unsigned* tag, int call, int T, float* scratch, void* st, void* xq) {
     ring_call_check(call, "attn_finish");
-    AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * HD);
-    float* part = scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * (HD + 2);
+    AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH_LOC * ATT_SPLITS * HD);
+    float* part = scratch + (size_t) ATT_ROWS * NQH_LOC * ATT_SPLITS * (HD + 2);
     cudaStream_t s = (cudaStream_t) st;
+#if FNX_ATT_MM
+    if (att_mm_attn()) {
+        int8_t* tq = nullptr;
+        float* td = nullptr;
+        const bool fq = xq && att_q8_fused();
+        if (fq) twin_of(xq, NQH_LOC * HD, tq, td);
+        k_attn_combine_n<<<dim3(NQH_LOC, T), HD, 0, s>>>(qg, scratch, mz, out, NQH_LOC, att_mm_splits(T), fq ? (block_q8_1*) xq : nullptr, tq, td);
+        ck_launch("attn finish");
+        if (xq && !fq) quantize_q8_1(out, xq, NQH_LOC * HD, T, st);
+        (void) part, (void) ar, (void) tag;
+        return;
+    }
+#endif
+    if constexpr (ATT_HEADS) {   // by heads: no merge across the cards (attn's)
+        k_attn_combine<<<dim3(NQH_LOC, T), HD, 0, s>>>(qg, scratch, mz, out, NQH_LOC);
+        ck_launch("attn finish");
+        if (xq) quantize_q8_1(out, xq, NQH_LOC * HD, T, st);
+        (void) part, (void) ar, (void) tag;
+        return;
+    }
     k_attn_local<<<dim3(NQH, T), HD, 0, s>>>(scratch, mz, part);
     if (ar.onehop) k_att_merge_a2a<<<dim3(ATT_OWN, T), HD, 0, s>>>(ar, qg, part, out, T, tag, call);
     else k_att_merge<<<dim3(ATT_OWN, T), HD, 0, s>>>(ar, qg, part, out, T, tag, call);
     ck_launch("attn finish");
+    if (xq) quantize_q8_1(out, xq, NQH_LOC * HD, T, st);
 }
 
 size_t attn_prompt_block_floats(int C) { return (size_t) C * ATT_OWN * AP_W; }
+int attn_prompt_union_rows() {
+#if FNX_HIP
+    if constexpr (ATT_HEADS) {
+        static const int r = [] {
+            const int v = (int) env_int("FNX_PF_ATT_UNION", 4);
+            if (v != 0 && v != 4 && v != 8) throw std::runtime_error("FNX_PF_ATT_UNION: 0, 4 or 8");
+            if (v)
+                if (const tk::Family* f = tk::family("pf_attn_u")) {   // the generator's variant: its rows a group (the walk's and its lists' builder's)
+                    const int r = f->kern(0).meta[0];
+                    if (r < 1 || r > 16 || f->kern(1).meta[0] != r) throw std::runtime_error("tk: pf_attn_u " + f->variant + ": the walk and the lists' builder differ in rows a group");
+                    return r;
+                }
+            return v;
+        }();
+        return r;
+    }
+#endif
+    return 0;
+}
+size_t attn_prompt_union_ints(int C) {
+    const int R = attn_prompt_union_rows();
+    if (!R) return 0;
+    const size_t groups = (size_t) (C + R - 1) / R;
+    return groups * ((size_t) R * (QSA_TOP + 1) + 1);   // the groups' lists, then their counts
+}
 
 void attn_prompt(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0, const int* cells,
-                 const int* n_cells, int card, int C, int r0, int T, float* part, void* st) {
+                 const int* n_cells, int card, int C, int r0, int T, float* part, void* st, int* uscr) {
     if (T == 0) return;   // an empty half of a one-row chunk
-#if !FNX_HIP && FNX_ARCH >= 80
+#if !FNX_HIP && FNX_ARCH >= 80 && !FNX_ATT_HEADS
     // FNX_PFX_ATTN_I8: the INT8 tensor-core kernel (attn_prompt_i8.cuh) on int8 K/V pages, on by default on NVIDIA sm_80+ for the IQ3_S-type files and off for the others (UD-Q4_K_XL lost agent-A8 and A10 with it); FNX_PFX_ATTN_I8=0/1 overrides; HIP keeps the f16 kernel
     static const int i8_env = (int) env_int("FNX_PFX_ATTN_I8", -1);
     const bool i8 = i8_env >= 0 ? i8_env != 0 : attn_i8_default();
@@ -1445,7 +2209,109 @@ void attn_prompt(const float* qg, const uint16_t* kc, const uint16_t* vc, const 
         return;
     }
 #endif
-    k_pf_attn<<<dim3(T, NKVH), AP_THREADS, AP_SMEM, (cudaStream_t) st>>>(qg, reinterpret_cast<const __half*>(kc),
+#if FNX_HIP && FNX_ATT_HEADS
+    // FNX_PF_ATT_UNION=4 (default) or 8, 0 = off (by heads): groups of rows walk the union of their selected positions (attn_prompt.cuh,
+    // k_pf_attn_u). FNX_PF_ATT_UNION_CHECK=N: the first N calls also run k_pf_attn and print how far the two partials differ (syncs)
+    if constexpr (ATT_HEADS) {
+        const int urows = attn_prompt_union_rows();
+        if (urows && cells) {
+            if (!uscr) throw std::runtime_error("attn_prompt: the union walk needs its scratch (attn_prompt_union_ints)");
+            struct Scratch { float* ref = nullptr; size_t ref_floats = 0; };   // FNX_PF_ATT_UNION_CHECK's own (lazy)
+            static Scratch sc[64];
+            int dev = 0;
+            cudaGetDevice(&dev);
+            Scratch& x = sc[dev & 63];
+            const size_t groups = (size_t) (T + urows - 1) / urows, ul_n = (size_t) urows * (QSA_TOP + 1);
+            if (groups * (ul_n + 1) > attn_prompt_union_ints(C)) throw std::runtime_error("attn_prompt: union scratch too small");
+            struct { int* ul; int* uc; } u{uscr, uscr + groups * ul_n};
+            cudaStream_t s = (cudaStream_t) st;
+            const __half* k16 = reinterpret_cast<const __half*>(kc);
+            const __half* v16 = reinterpret_cast<const __half*>(vc);
+            static const tk::Family* const tkf = tk::family("pf_attn_u");   // the generator's variant (key 0 the walk, key 1 the lists' builder)
+            if (tkf) {
+                const tk::Kern &kw = tkf->kern(0), &ku = tkf->kern(1);
+                FNX_TK_LAUNCH(ku, k_pf_union<4>, dim3((unsigned) groups), dim3(ku.threads), ku.smem, s, cells, n_cells, pos0, r0, T, u.ul, u.uc);
+                FNX_TK_LAUNCH(kw, k_pf_attn_u<4>, dim3((unsigned) groups), dim3(kw.threads), kw.smem, s, qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+            } else if (urows == 8) {
+                k_pf_union<8><<<groups, 256, 0, s>>>(cells, n_cells, pos0, r0, T, u.ul, u.uc);
+                k_pf_attn_u<8><<<groups, AP_THREADS, AuShape<8>::SMEM, s>>>(qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+            } else {
+                k_pf_union<4><<<groups, 256, 0, s>>>(cells, n_cells, pos0, r0, T, u.ul, u.uc);
+                static const bool ureg = env_int("FNX_PF_ATT_UREG", 1) != 0;   // attn_prompt.cuh AuShape: O in accumulator tiles (default 1: +5.5 % read rate at 127K)
+                static const int upc = (int) env_int("FNX_PF_ATT_PC", 32);   // positions a union-walk tile (32 or 64; 64 needs FNX_PF_ATT_UREG=1)
+                static const bool ulean = env_int("FNX_PF_ATT_LEAN", 1) != 0;   // attn_prompt.cuh AuShape LEAN: < 32 KB shared memory, 4 blocks a WGP (default 1: +1.3 / +1.6 / +0.9 % read at 127K / 80K / 8K; same sums)
+                // FNX_PF_ATT_GW (default 2; the default layout only): the walk's gather. 1: a thread takes one (position, group of 32 values) with two 16-byte loads and
+                // one scale load; 2: also, a tile's V gather takes the row places of its K gather; 0: four 8-byte loads of four positions a thread. The same bits
+                // (kbench pfattn, 109K: 6.89 / 5.34 / 5.17 ms a launch for 0 / 1 / 2; reads +2.2 % at 80K with 1)
+                static const int ugw = (int) env_int("FNX_PF_ATT_GW", 2);
+                if (ugw < 0 || ugw > 2) throw std::runtime_error("FNX_PF_ATT_GW: 0, 1 or 2");
+                if (ureg && ulean && upc != 64 && ugw == 2) k_pf_attn_u<4, true, APC, true, 0, 2><<<groups, AP_THREADS, AuShape<4, true, APC, true>::SMEM, s>>>(qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+                else if (ureg && ulean && upc != 64 && ugw == 1) k_pf_attn_u<4, true, APC, true, 0, 1><<<groups, AP_THREADS, AuShape<4, true, APC, true>::SMEM, s>>>(qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+                else if (ureg && ulean && upc != 64) k_pf_attn_u<4, true, APC, true><<<groups, AP_THREADS, AuShape<4, true, APC, true>::SMEM, s>>>(qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+                else if (ureg && upc == 64) k_pf_attn_u<4, true, 64><<<groups, AP_THREADS, AuShape<4, true, 64>::SMEM, s>>>(qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+                else if (ureg) k_pf_attn_u<4, true><<<groups, AP_THREADS, AuShape<4, true>::SMEM, s>>>(qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+                else k_pf_attn_u<4><<<groups, AP_THREADS, AuShape<4>::SMEM, s>>>(qg, k16, v16, g, pos0, u.ul, u.uc, card, C, r0, T, part);
+            }
+            ck_launch("attn_prompt (union)");
+            static const int checks = (int) env_int("FNX_PF_ATT_UNION_CHECK", 0);
+            static std::atomic<int> checked{0};
+            static const int check_min = (int) env_int("FNX_PF_ATT_UNION_CHECK_MIN", 0);   // only calls whose first row is at this position or later
+            int cp0 = 0;
+            if (checks > 0 && checked.load() < checks && check_min > 0) cudaStreamSynchronize(s), cudaMemcpy(&cp0, pos0, sizeof(int), cudaMemcpyDeviceToHost);
+            if (checks > 0 && checked.load() < checks && cp0 >= check_min) {
+                const size_t blk = (size_t) C * ATT_OWN * AP_W, all = (size_t) NCARD * blk;
+                if (all > x.ref_floats) {
+                    if (x.ref) cudaFree(x.ref);
+                    if (cudaMalloc(&x.ref, all * sizeof(float)) != cudaSuccess) throw std::runtime_error("FNX_PF_ATT_UNION_CHECK: scratch");
+                    x.ref_floats = all;
+                }
+                k_pf_attn<<<dim3(T, KVH_LOC), AP_THREADS, AP_SMEM, s>>>(qg, k16, v16, g, pos0, cells, n_cells, card, C, r0, x.ref);
+                ck_launch("attn_prompt (check)");
+                std::vector<float> a((size_t) T * ATT_OWN * AP_W), b(a.size());
+                const size_t off = (size_t) card * blk + (size_t) r0 * ATT_OWN * AP_W;
+                cudaStreamSynchronize(s);
+                cudaMemcpy(a.data(), part + off, a.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(b.data(), x.ref + off, b.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                int p0 = 0;
+                cudaMemcpy(&p0, pos0, sizeof(int), cudaMemcpyDeviceToHost);
+                {
+                    const cudaError_t le = cudaGetLastError();
+                    std::vector<int> uc(std::min<size_t>(groups, 4)), u0(16);
+                    cudaMemcpy(uc.data(), u.uc, uc.size() * sizeof(int), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(u0.data(), u.ul, u0.size() * sizeof(int), cudaMemcpyDeviceToHost);
+                    long bu = 0, bv = 0;
+                    for (size_t r = 0; r < (size_t) T * ATT_OWN; ++r) bu += !(a[r * AP_W + HD + 1] > 0.f), bv += !(b[r * AP_W + HD + 1] > 0.f);
+                    std::fprintf(stderr, "fnx: attn union diag: last error %d, groups %zu, ucount %d %d %d %d, ul[0..7] %x %x %x %x %x %x %x %x; row 0 head 0: union m %g z %g o0 %g / ref m %g z %g o0 %g; "
+                                         "row %d: union m %g z %g / ref m %g z %g; zero-sum rows: union %ld ref %ld\n",
+                                 (int) le, groups, uc[0], uc.size() > 1 ? uc[1] : -1, uc.size() > 2 ? uc[2] : -1, uc.size() > 3 ? uc[3] : -1, u0[0], u0[1], u0[2], u0[3], u0[4], u0[5], u0[6], u0[7],
+                                 a[HD], a[HD + 1], a[0], b[HD], b[HD + 1], b[0], T - 1, a[((size_t) (T - 1) * ATT_OWN) * AP_W + HD], a[((size_t) (T - 1) * ATT_OWN) * AP_W + HD + 1],
+                                 b[((size_t) (T - 1) * ATT_OWN) * AP_W + HD], b[((size_t) (T - 1) * ATT_OWN) * AP_W + HD + 1], bu, bv);
+                }
+                double worst = 0, lse = 0, sum = 0;
+                long bad = 0, n = 0;
+                for (size_t r = 0; r < (size_t) T * ATT_OWN; ++r) {
+                    const float* u = a.data() + r * AP_W;
+                    const float* v = b.data() + r * AP_W;
+                    if (!(u[HD + 1] > 0.f) || !(v[HD + 1] > 0.f) || !std::isfinite(u[HD]) || !std::isfinite(v[HD])) { ++bad; continue; }
+                    double mx = 0, df = 0;
+                    for (int d = 0; d < HD; ++d) {
+                        const double ou = u[d] / u[HD + 1], ov = v[d] / v[HD + 1];
+                        if (!std::isfinite(ou) || !std::isfinite(ov)) ++bad;
+                        mx = std::max(mx, std::fabs(ov)), df = std::max(df, std::fabs(ou - ov));
+                    }
+                    const double rel = df / std::max(mx, 1e-20);
+                    worst = std::max(worst, rel), sum += rel, ++n;
+                    lse = std::max(lse, std::fabs((u[HD] + std::log((double) u[HD + 1])) - (v[HD] + std::log((double) v[HD + 1]))));
+                }
+                std::fprintf(stderr, "fnx: attn union check (R %d, card %d, pos0 %d, rows %d): output rel. diff max %.3g mean %.3g, log-sum diff max %.3g, bad %ld of %ld\n",
+                             urows, card, p0, T, worst, n ? sum / n : 0.0, lse, bad, n);
+                checked.fetch_add(1);
+            }
+            return;
+        }
+    }
+#endif
+    k_pf_attn<<<dim3(T, KVH_LOC), AP_THREADS, AP_SMEM, (cudaStream_t) st>>>(qg, reinterpret_cast<const __half*>(kc),
                                                                          reinterpret_cast<const __half*>(vc), g, pos0, cells, n_cells,
                                                                          card, C, r0, part);
     ck_launch("attn_prompt");
@@ -1494,9 +2360,15 @@ __device__ __forceinline__ void rb_signal(unsigned* flag, unsigned tag) {
 }
 __device__ __forceinline__ void rb_wait(const unsigned* flag, unsigned tag, unsigned* err) {
     if (threadIdx.x == 0) {
-        const long long t0 = clock64();
+        const long long ts = clock64();
+        long long t0 = ts;
         while (*(const volatile unsigned*) flag != tag)
-            if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+            if (const long long dt = clock64() - t0; __builtin_expect(dt > RING_TIMEOUT_CYCLES, 0)) {
+                if (diag_wait_on(err, dt, RING_TIMEOUT_CYCLES, ts, t0)) continue;   // the driver had the queues off the cards
+                diag_timeout(err, DK_CHUNK_RING, tag, *(const volatile unsigned*) flag, 0u, DG_NO_SRC, (unsigned) blockIdx.x, dt);
+                atomicOr(err, 1u);
+                break;
+            }
         __threadfence_system();
     }
     __syncthreads();
@@ -1592,15 +2464,21 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
     }
     int grid = std::max(4, std::min(T > MAXT ? 240 : 40, (T * NP / NCARD + 255) / 256));
 #if FNX_HIP
-    // FNX_RING_GRID=n (screen): the one-hop window sum on n blocks of 256 threads instead of at most 40; at 16 rows the 17 blocks left each thread 3-4 elements to push and then wait for
-    // one after the other, a remote round trip each
+    // FNX_RING_GRID=n: the one-hop window sum on n blocks of 256 threads, at most one block for 256 elements of the whole sum (not of a card's
+    // share): few blocks leave each thread several elements to push and then wait for one after the other, a remote round trip each.
+    // 40 is the rule on 4 cards with the host mailbox (4 x R9700, Q4, 2026-11-13: 5 -> 20 blocks at 4 rows, 10 -> 40 at 8; one user
+    // 185.0 -> 191.2 tok/s, the same answers; 80 and 160 add nothing). 0: the upstream rule. Other card counts, the peer push and the legacy
+    // rings were not measured: unchanged unless the switch is given
     if (T <= MAXT) {
-        static const int g = (int) env_int("FNX_RING_GRID", 0);
-        if (g > 0) grid = std::min(g, (T * NP + 255) / 256);
+        static const int g = (int) env_int("FNX_RING_GRID", -1);
+        const int use = g >= 0 ? g : (FAST && NCARD == 4 && r.onehop && !r.peer ? 40 : 0);
+        if (use > 0) grid = std::min(use, (T * NP + 255) / 256);
     }
 #endif
     if (r.peer && T <= MAXT) {
-        k_ring_a2a_push<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        static const bool two = fast_opt("FNX_RING_2PHASE");
+        if (two) k_ring_a2a_push<true><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        else k_ring_a2a_push<false><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
         ck_launch("ring_sum (one hop, peer push)");
         return;
     }
@@ -1647,6 +2525,45 @@ void penalize_row(float* row, int n, const int* pen, const float* par, void* st)
     ck_launch("penalize_row");
 }
 
+// (Engine::draft_lanes' table form): k_penalize_row for lane blockIdx.x of a batched draft call, its row from the card's table.
+// sel[2 * i + 1] of lane i: bits 0-15 its last row, bit 16 set: the lane penalizes. The arithmetic is k_penalize_row's, word for word.
+namespace {
+__global__ void k_penalize_lanes(float* logits, int n, const int* pens, int pen_stride, const float* pars, const int* sel) {
+    const int lane = blockIdx.x, w = sel[2 * lane + 1];
+    if (!(w & 0x10000)) return;
+    float* L = logits + (size_t) (w & 0xffff) * n;
+    const int* pen = pens + (size_t) lane * pen_stride;
+    const float* par = pars + 3 * lane;
+    const int k = pen[0];
+    const float repeat = par[0], freq = par[1], present = par[2];
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        const int j = pen[1 + i], cnt = pen[1 + k + i];
+        if (j < 0 || j >= n || cnt <= 0) continue;
+        float l = L[j];
+        l = l <= 0.f ? l * repeat : l / repeat;
+        L[j] = l - (float) cnt * freq - present;
+    }
+}
+// each lane's last row (sel as above) copied to row `lane` of out: the candidates' launches then take fixed rows
+__global__ void k_gather_lanes(const float* __restrict__ logits, int n, const int* sel, float* __restrict__ out) {
+    const int lane = blockIdx.y;
+    const float* s = logits + (size_t) (sel[2 * lane + 1] & 0xffff) * n;
+    float* d = out + (size_t) lane * n;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < n; j += gridDim.x * blockDim.x) d[j] = s[j];
+}
+}  // namespace
+
+void penalize_lanes(float* logits, int n, const int* pens, int pen_stride, const float* pars, const int* sel, int lanes, void* st) {
+    if (lanes <= 0) return;
+    k_penalize_lanes<<<lanes, 256, 0, (cudaStream_t) st>>>(logits, n, pens, pen_stride, pars, sel);
+    ck_launch("penalize_lanes");
+}
+void gather_lanes(const float* logits, int n, const int* sel, float* out, int lanes, void* st) {
+    if (lanes <= 0 || n <= 0) return;
+    k_gather_lanes<<<dim3(4, lanes), 256, 0, (cudaStream_t) st>>>(logits, n, sel, out);
+    ck_launch("gather_lanes");
+}
+
 namespace {
 __global__ void k_copy_many(const CopyJob* jobs) {
     const CopyJob j = jobs[blockIdx.y];
@@ -1684,17 +2601,18 @@ void hc_write(float* R, const float* bo, const float* inj, int T, void* st) {
 namespace fnx {
 namespace {
 // row t (block y) of the window, if its position's block is this card's: both KV heads to the local index
-__global__ void k_kv_append(const float* k, const float* v, __half* kc, __half* vc, KvPages g, int card, const int* pos0p) {
-    const int t = blockIdx.y, p = *pos0p + t, j = p / 4;
-    if (kv_card(j) != card) return;
-    const int r = kv_local_block(j) * 4 + p % 4;
+__global__ void k_kv_append(const float* k, const float* v, __half* kc, __half* vc, KvPages g, int card, const int* pos0p, LaneRows lr) {
+    const int t = blockIdx.y, p = row_pos(lr, pos0p, t), j = p / 4;
+    if (!kv_mine(j, card)) return;
+    g = row_pages(g, lr, t);
+    const int r = kv_local_row(p);
     if (g.q8) {
         // a warp's 32 elements are one group: d = max |x| / 127, q = round(x / d) (llama.cpp's q8_0)
         static_assert(KV8_GROUP == 32, "a group per warp");
         int8_t *kq = reinterpret_cast<int8_t*>(kc), *vq = reinterpret_cast<int8_t*>(vc);
         const size_t at = kvq_row(g, r), sc = kvq_scale(g, r);
-        for (int e = threadIdx.x; e < NKVH * HD; e += blockDim.x) {
-            const float x[2] = {k[(size_t) t * NKVH * HD + e], v[(size_t) t * NKVH * HD + e]};
+        for (int e = threadIdx.x; e < KV_W; e += blockDim.x) {
+            const float x[2] = {k[(size_t) t * KV_W + e], v[(size_t) t * KV_W + e]};
 #pragma unroll
             for (int w = 0; w < 2; ++w) {
                 const float d = wmax(fabsf(x[w])) / 127.f, id = d != 0.f ? 1.f / d : 0.f;
@@ -1705,9 +2623,9 @@ __global__ void k_kv_append(const float* k, const float* v, __half* kc, __half* 
         return;
     }
     const size_t at = kvp_row(g, r);
-    for (int e = threadIdx.x; e < NKVH * HD; e += blockDim.x) {
-        kc[at + e] = __float2half_rn(k[(size_t) t * NKVH * HD + e]);
-        vc[at + e] = __float2half_rn(v[(size_t) t * NKVH * HD + e]);
+    for (int e = threadIdx.x; e < KV_W; e += blockDim.x) {
+        kc[at + e] = __float2half_rn(k[(size_t) t * KV_W + e]);
+        vc[at + e] = __float2half_rn(v[(size_t) t * KV_W + e]);
     }
 }
 
@@ -1718,23 +2636,23 @@ __global__ void __launch_bounds__(HD) k_attn_prep_append(float* qg, float* k, co
                                                          __half* vc, KvPages g, int card, const int* pos0p, float eps, Rope base) {
     const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x, p = *pos0p + t, j = p / 4;
     __shared__ float sh[32];
-    if (h < NQH) {
-        norm_rope(qg + ((size_t) t * NQH + h) * 2 * HD, qn, p, eps, base, sh);
+    if (h < NQH_LOC) {
+        norm_rope(qg + ((size_t) t * NQH_LOC + h) * 2 * HD, qn, p, eps, base, sh);
         return;
     }
-    const bool is_k = h < NQH + NKVH;
-    const int kh = h - NQH - (is_k ? 0 : NKVH), e = kh * HD + i;
+    const bool is_k = h < NQH_LOC + KVH_LOC;
+    const int kh = h - NQH_LOC - (is_k ? 0 : KVH_LOC), e = kh * HD + i;
     float x;
     if (is_k) {
-        float* kr = k + ((size_t) t * NKVH + kh) * HD;
+        float* kr = k + ((size_t) t * KVH_LOC + kh) * HD;
         norm_rope(kr, kn, p, eps, base, sh);
         __syncthreads();
         x = kr[i];
     } else {
-        x = v[(size_t) t * NKVH * HD + e];
+        x = v[(size_t) t * KV_W + e];
     }
-    if (kv_card(j) != card) return;
-    const int r = kv_local_block(j) * 4 + p % 4;
+    if (!kv_mine(j, card)) return;
+    const int r = kv_local_row(p);
     __half* cache = is_k ? kc : vc;
     if (g.q8) {
         static_assert(KV8_GROUP == 32 && HD % 32 == 0, "a group per warp");
@@ -1898,12 +2816,18 @@ bool kv_q8() {
 }
 void kv_append(const float* k, const float* v, uint16_t* kc, uint16_t* vc, const KvPages& g, int card, int T, const int* pos0, void* st) {
     k_kv_append<<<dim3(1, T), 256, 0, (cudaStream_t) st>>>(k, v, reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, card,
-                                                           pos0);
+                                                           pos0, LaneRows{});
     ck_launch("kv_append");
+}
+void kv_append_lanes(const float* k, const float* v, uint16_t* kc, uint16_t* vc, const KvPages& g, int card, int T, const LaneRows& lr, void* st) {
+    if (!lr.pos || !lr.pt) throw std::runtime_error("kv_append_lanes: no lane rows");
+    k_kv_append<<<dim3(1, T), 256, 0, (cudaStream_t) st>>>(k, v, reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, card,
+                                                           nullptr, lr);
+    ck_launch("kv_append_lanes");
 }
 void attn_prep_append(float* qg, float* k, const float* v, const float* q_norm, const float* k_norm, uint16_t* kc, uint16_t* vc,
                       const KvPages& g, int card, int T, const int* pos0, float eps, Rope base, void* st) {
-    k_attn_prep_append<<<dim3(NQH + 2 * NKVH, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm, reinterpret_cast<__half*>(kc),
+    k_attn_prep_append<<<dim3(NQH_LOC + 2 * KVH_LOC, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm, reinterpret_cast<__half*>(kc),
                                                                           reinterpret_cast<__half*>(vc), g, card, pos0, eps, base);
     ck_launch("attn_prep_append");
 }
@@ -2046,7 +2970,16 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
             cudaStreamSynchronize(s);
             cudaFree(s0), cudaFree(yr);
         }
+#if FNX_ATT_MM && FNX_HIP
+        static const bool gdn_mm = env_int("FNX_PF_GDN_MM", APPROX) != 0;   // measured +8.3-9.3 % prompt reads
+        if (gdn_mm) k_gdn_ch_prep<true><<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
+        else
+#endif
         k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
+#if FNX_ATT_MM && FNX_HIP
+        if (gdn_mm) k_gdn_ch_rec_mm<0><<<nv * GCH_REC_BLOCKS_PER_HEAD, GMM_THREADS, 0, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        else
+#endif
         k_gdn_ch_rec<<<nv * GCH_REC_BLOCKS_PER_HEAD, GCR_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
         if (check) {
             std::vector<float> y(ny), sn(ns);
@@ -2113,7 +3046,12 @@ namespace fnx {
 #if FNX_KPART == 8
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
-                  float* sh_out) {
+                  float* sh_out, const uint16_t* Wbf
+#if FNX_MALL_PF
+                  ,
+                  unsigned* pf_word, int pf_late
+#endif
+) {
     cudaStream_t s = (cudaStream_t) st;
     ShexpUp su;
     if (sh_gu) {
@@ -2126,11 +3064,31 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
         twin_of(sh_y, N, tq, td);
         su.tq = tq, su.td = td;
     }
-    const int grid = (NEXP + 1 + RR_ROWS - 1) / RR_ROWS + su.blocks;
     unsigned* counter = (unsigned*) (njobs + 1);
     const ExpertCache none{};
     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su)
+// with the prefetch build the kernel has two more arguments, the persistent prefetcher's count (null: none) and where it adds one
+#if FNX_MALL_PF
+#define FNX_RR_PF , pf_word, pf_late
+#else
+#define FNX_RR_PF
+#endif
+#if FNX_ROUTER_BF16
+    // the bf16 table when the layer has one (model.cpp: every value exact) and the switch is on; else the f32 table and the kernel as it was
+    const int bf = Wbf ? router_bf16_mode() : 0;
+    const int grid = (NEXP + 1 + rr_rows(bf) - 1) / rr_rows(bf) + su.blocks;
+    const float* Wk = bf ? reinterpret_cast<const float*>(Wbf) : W;
+#define FNX_RR(t)                                                                                                                                   \
+    do {                                                                                                                                            \
+        if (bf == 2) k_router_route<t, 2><<<grid, RR_THREADS, 0, s>>>(Wk, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su FNX_RR_PF); \
+        else if (bf == 1) k_router_route<t, 1><<<grid, RR_THREADS, 0, s>>>(Wk, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su FNX_RR_PF); \
+        else k_router_route<t, 0><<<grid, RR_THREADS, 0, s>>>(Wk, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su FNX_RR_PF); \
+    } while (0)
+#else
+    (void) Wbf;
+    const int grid = (NEXP + 1 + RR_ROWS - 1) / RR_ROWS + su.blocks;
+#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su FNX_RR_PF)
+#endif
     switch (T) {
         case 1: FNX_RR(1); break;
         case 2: FNX_RR(2); break;
@@ -2151,7 +3109,26 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
         default: throw std::runtime_error("router_route: T out of range");
     }
 #undef FNX_RR
+#undef FNX_RR_PF
     ck_launch("router_route");
+}
+
+// FNX_ROUTER_BF16 (kernels.hpp): the environment is read once; router_bf16_force is kbench's override
+namespace {
+int router_bf16_force_ = -1;
+}
+void router_bf16_force(int mode) { router_bf16_force_ = mode; }
+int router_bf16_mode() {
+#if FNX_ROUTER_BF16
+    static const int env = [] {
+        const long long m = env_int("FNX_ROUTER_BF16", 1);
+        if (m < 0 || m > 2) throw std::runtime_error("FNX_ROUTER_BF16: 0 (the f32 table), 1 (bf16) or 2 (bf16, one warp a row), got " + std::to_string(m));
+        return (int) m;
+    }();
+    return router_bf16_force_ >= 0 ? (router_bf16_force_ > 2 ? 2 : router_bf16_force_) : env;
+#else
+    return 0;
+#endif
 }
 
 #endif
@@ -2316,16 +3293,62 @@ void q8s_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, int T,
     if (tq) q8s_launch<R, true, SEG>(g, rows, cols, y, tq, td, T, s);
     else q8s_launch<R, false, SEG>(g, rows, cols, y, nullptr, nullptr, T, s);
 }
+#if FNX_MM && FNX_HIP
+// the matrix kernel (dense.cuh q8s_mm_block): a block per 16 rows
+template <bool SPLIT, bool SEG>
+void q8s_mm_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, const int8_t* tq, const float* td, int T, cudaStream_t s) {
+    const dim3 grid((rows + 15) / 16);
+#define FNX_Q8M(t) k_q8s_mm<t, SPLIT, SEG><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td)
+    switch (T) {
+        case 1: FNX_Q8M(1); break;
+        case 2: FNX_Q8M(2); break;
+        case 3: FNX_Q8M(3); break;
+        case 4: FNX_Q8M(4); break;
+        case 5: FNX_Q8M(5); break;
+        case 6: FNX_Q8M(6); break;
+        case 7: FNX_Q8M(7); break;
+        case 8: FNX_Q8M(8); break;
+        case 9: FNX_Q8M(9); break;
+        case 10: FNX_Q8M(10); break;
+        case 11: FNX_Q8M(11); break;
+        case 12: FNX_Q8M(12); break;
+        case 13: FNX_Q8M(13); break;
+        case 14: FNX_Q8M(14); break;
+        case 15: FNX_Q8M(15); break;
+        case 16: FNX_Q8M(16); break;
+        default: throw std::runtime_error("q8s_gemv: T out of range");
+    }
+#undef FNX_Q8M
+}
+#endif
 template <bool SEG>
 void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st) {
     if (cols % 16) throw std::runtime_error("q8s_gemv: columns must be a multiple of 16");
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
+#if FNX_MM && FNX_HIP
+    if (cols % 32 == 0 && mm_dense(T)) {
+        int8_t* tq;
+        float* td;
+        twin_of(yq, cols, tq, td);
+        if (tq) q8s_mm_launch<true, SEG>(g, rows, cols, yq, tq, td, T, s);
+        else q8s_mm_launch<false, SEG>(g, rows, cols, yq, nullptr, nullptr, T, s);
+        ck_launch("q8s_gemv");
+        return;
+    }
+#endif
     // rows per warp: four for big matrices (activation loads shared by more rows), one when that leaves few blocks. The
     // segmented variant only for its one use, q/k/v (8192 rows and more): fewer kernels to compile
     if constexpr (SEG) {
+#if FNX_ATT_HEADS
+        // by heads q, k and v are 3584 rows a card: the rows per warp q8s_gemv takes for that many (each matrix's output as it alone gives)
+        if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+        else if (rows >= 4096) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+        else q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
+#else
         if (rows < 8192) throw std::runtime_error("q8s_gemv_segs: compiled for 8192 rows or more (q, k and v)");
         q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+#endif
     } else {
 #if FNX_27B
         // up to 4 rows by the window (the 27B's windows, bin/s27_run S27_BENCH=1: 1 row 19.4 -> 18.3 ms, 4 rows
@@ -2410,6 +3433,39 @@ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, c
     for (int s = 0; s < Q8S_SEGS; ++s) g.q[s] = w.q, g.d[s] = w.d, g.out[s] = out, g.end[s] = rows, g.stride[s] = rows;
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
+#if FNX_MM && FNX_HIP
+    if (cols % 32 == 0 && mm_dense(T)) {   // the matrix kernel's blocks after the f32 rows' (any row count)
+        int8_t* tq;
+        float* td;
+        twin_of(yq, cols, tq, td);
+        const dim3 grid(rf + (rows + 15) / 16);
+#define FNX_QAM(t)                                                                                                    \
+    if (tq) k_q8s_ab_mm<t, true><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, yq, tq, td, W, x, yf, rf);                \
+    else k_q8s_ab_mm<t, false><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, yq, nullptr, nullptr, W, x, yf, rf)
+        switch (T) {
+            case 1: FNX_QAM(1); break;
+            case 2: FNX_QAM(2); break;
+            case 3: FNX_QAM(3); break;
+            case 4: FNX_QAM(4); break;
+            case 5: FNX_QAM(5); break;
+            case 6: FNX_QAM(6); break;
+            case 7: FNX_QAM(7); break;
+            case 8: FNX_QAM(8); break;
+            case 9: FNX_QAM(9); break;
+            case 10: FNX_QAM(10); break;
+            case 11: FNX_QAM(11); break;
+            case 12: FNX_QAM(12); break;
+            case 13: FNX_QAM(13); break;
+            case 14: FNX_QAM(14); break;
+            case 15: FNX_QAM(15); break;
+            case 16: FNX_QAM(16); break;
+            default: throw std::runtime_error("q8s_gemv_f32: T out of range");
+        }
+#undef FNX_QAM
+        ck_launch("q8s_gemv_f32");
+        return;
+    }
+#endif
     // compiled for its one use, qkvz, as q8s_gemv alone would run them: 4096 to 8191 rows two a warp; the 27B's 8192
     // and more (on two cards) four
 #if FNX_27B
@@ -2450,6 +3506,325 @@ void l2_prefetch(const void* p, size_t bytes, void* st) {
     k_l2_prefetch<<<(unsigned) std::min<size_t>(160, (sectors + 255) / 256), 256, 0, (cudaStream_t) st>>>((const char*) p, sectors, sink);
     ck_launch("l2_prefetch");
 }
+
+// which kernels the fixed-weight products take (kernels.hpp). The environment is read once; mm_force is kbench's override
+namespace {
+int mm_force_dense_ = -1, mm_force_hc_ = -1;
+#if FNX_MM && FNX_HIP
+// the matrix kernels are gfx12 code (mm.cuh: on another family the instruction is a trap): is the current card one? A card of another family keeps the
+// dp4a kernels and k_hc whatever the switches and mm_force say (a build may hold gfx11 code objects too). Asked once a card.
+bool mm_gfx12() {
+    static std::atomic<int> known[64] = {};   // 0 not asked, 1 gfx12, -1 not
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return false;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (!k) {
+        hipDeviceProp_t p{};
+        k = hipGetDeviceProperties(&p, dev) == hipSuccess && std::strncmp(p.gcnArchName, "gfx12", 5) == 0 ? 1 : -1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k > 0;
+}
+#endif
+}  // namespace
+void mm_force(int dense, int hc) { mm_force_dense_ = dense, mm_force_hc_ = hc; }
+bool mm_dense(int T) {
+#if FNX_MM && FNX_HIP
+    if (!mm_gfx12()) return false;
+    static const long long min_rows = [] {
+        const long long r = env_int("FNX_MM_DENSE", 0);
+        if (r < 0 || r > MAXT) throw std::runtime_error("FNX_MM_DENSE: 0 (off) or the window's rows from which the matrix kernel runs, 1.." +
+                                                        std::to_string(MAXT) + ", got " + std::to_string(r));
+        return r;
+    }();
+    if (mm_force_dense_ >= 0) return mm_force_dense_ != 0;
+    return min_rows > 0 && T >= min_rows;
+#else
+    (void) T;
+    return false;
+#endif
+}
+bool mm_hc() {
+#if FNX_MM_HC && FNX_HIP
+    if (!mm_gfx12()) return false;
+    static const bool on = env_int("FNX_MM_HC", APPROX) != 0;
+    return mm_force_hc_ >= 0 ? mm_force_hc_ != 0 : on;
+#else
+    return false;
+#endif
+}
+// generator: the engine's start. Reads the run's kernel variants (src/tk.hpp: FNX_TK_DIR, FNX_TK_<FAMILY>) and checks that each selected
+// one's launch path is on in this run: an arm must not run the built-in kernel under a variant's name. (moe_gu_q4k has no such check: it takes the
+// layers whose experts' gate|up weights are Q4_K, and a file may hold other types too.)
+void tk_start() {
+    tk::init({"pf_attn_u", "hc_mm", "moe_gu_q4k", "gemm8"});   // (the families with a launch site in this file, in moe_q4k.cuh and in prefill.cu)
+    if (!mm_hc()) tk::refuse("hc_mm", "the ticket-queue hc read is off in this run (FNX_MM_HC=1 turns it on)");
+    if (attn_prompt_union_rows() == 0) tk::refuse("pf_attn_u", "the prompt attention's union walk is off in this run (FNX_PF_ATT_UNION=0, or a build without it)");
+}
+}  // namespace fnx
+
+// the Infinity Cache prefetch (kernels.hpp PfSet)
+#ifndef FNX_MALL_PF
+#define FNX_MALL_PF 0
+#endif
+namespace fnx {
+#if FNX_MALL_PF && FNX_HIP
+namespace {
+typedef unsigned pf_v4 __attribute__((ext_vector_type(4)));
+typedef pf_v4 pf_v4_u __attribute__((aligned(1)));
+typedef unsigned pf_u32_u __attribute__((aligned(1)));
+// lane i0 of T lanes touches its share of `bytes` bytes at p (grid-striding); the xor of what it loaded
+__device__ __forceinline__ unsigned pf_touch_range(const char* p, size_t bytes, int line_bytes, int full, size_t T, size_t i0) {
+    unsigned acc = 0;
+    if (full) {   // every byte, 8 loads of 16 bytes in flight a lane
+        const pf_v4_u* q = reinterpret_cast<const pf_v4_u*>(p);
+        const size_t n16 = bytes / 16;
+        size_t i = i0;
+#pragma unroll 1
+        for (; i + 7 * T < n16; i += 8 * T) {
+            const pf_v4 a0 = q[i], a1 = q[i + T], a2 = q[i + 2 * T], a3 = q[i + 3 * T], a4 = q[i + 4 * T], a5 = q[i + 5 * T], a6 = q[i + 6 * T],
+                        a7 = q[i + 7 * T];
+            const pf_v4 x = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ a6 ^ a7;
+            acc ^= x.x ^ x.y ^ x.z ^ x.w;
+        }
+#pragma unroll 1
+        for (; i < n16; i += T) {
+            const pf_v4 x = q[i];
+            acc ^= x.x ^ x.y ^ x.z ^ x.w;
+        }
+    } else {        // one word a line: the load brings the whole line into the cache; 4 loads in flight a lane
+        const size_t line = (size_t) line_bytes, lines = (bytes + line - 1) / line, last = bytes - 4;
+        const auto at = [&](size_t l) { const size_t o = l * line; return *reinterpret_cast<const pf_u32_u*>(p + (o < last ? o : last)); };
+        size_t l = i0;
+#pragma unroll 1
+        for (; l + 3 * T < lines; l += 4 * T) {
+            const unsigned a0 = at(l), a1 = at(l + T), a2 = at(l + 2 * T), a3 = at(l + 3 * T);
+            acc ^= a0 ^ a1 ^ a2 ^ a3;
+        }
+#pragma unroll 1
+        for (; l < lines; l += T) acc ^= at(l);
+    }
+    return acc;
+}
+// the same over a set's ranges, in order
+__device__ __forceinline__ unsigned pf_touch(const PfSet& s, size_t T, size_t i0) {
+    unsigned acc = 0;
+#pragma unroll 1
+    for (int k = 0; k < s.n; ++k) acc ^= pf_touch_range(reinterpret_cast<const char*>(s.r[k].base), (size_t) s.r[k].bytes, s.line, s.full, T, i0);
+    return acc;
+}
+__global__ void __launch_bounds__(256) k_mall_pf(PfSet s) {
+    const unsigned acc = pf_touch(s, (size_t) gridDim.x * blockDim.x, blockIdx.x * (size_t) blockDim.x + threadIdx.x);
+    // keeps the loads: a store through a pointer the compiler cannot see the end of (a store to a file-local global was dropped, and every load with
+    // it). True for one lane in 2^32: a write of that one word to the sink
+    if (acc == 0x9e3779b9u) *s.sink = acc;
+}
+// The persistent form (FNX_MALL_PF_MODE=run): launched on a side stream before a window's graph, outside the graph (a side-stream node in a captured
+// graph cost ~90 us a layer on ROCm 7.2.4). words[0] counts the fork points run so far: the router's block 0 adds one a trunk layer (k_router_route's
+// pf argument). After p = words[0] - base of this window's fork points the block stages layer p's set (the layer after the one whose router ran),
+// p = n: layer 0's when wrap, and ends. Each block's thread 0 polls (s_sleep between loads), the rest wait at the block's barrier; a block that
+// falls behind goes straight to the newest set. It ends by itself: at p = n; at p > n (the host's count is not this window's: status bit 1); when
+// words[3] is set (the host's stop); or after `timeout` wall-clock ticks (status bit 0), so that a window that failed cannot leave it resident.
+// The events and what each stages are the host's table: an event is any kernel of the window that adds one to words[0] (the router, an hc read), and
+// set p is what the host wants staged after the window's p-th event (it can be empty).
+// a.gate (bytes, 0: none): the block stages a set in pieces of so many bytes and its thread 0 looks at the count before each piece. When a later
+// event has run it leaves the set (words[8]) and takes the newest one. With an empty set for the event before the expert kernels the block loads
+// nothing while they stream (they need the whole bus), and what it had not staged by then stays cold.
+__global__ void __launch_bounds__(256) k_mall_pf_run(PfRun a) {
+    __shared__ int next;
+    __shared__ int moved[2];
+    const size_t T = (size_t) gridDim.x * blockDim.x, i0 = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
+    const long long t0 = threadIdx.x == 0 ? wall_clock64() : 0;
+    if (threadIdx.x == 0) atomicAdd(a.words + 4, 1u);   // this block is resident (mall_pf_hc_probe waits for every block)
+    int done = 0;
+    unsigned acc = 0;
+    // the side stream's time account, by block 0's thread 0 (words[12..14], units of 64 ticks: a report's 4096 windows of the longest time-out stay
+    // under 2^32; t_rem keeps what is left under a unit): what the wait for the next event followed
+    const bool tm = blockIdx.x == 0 && threadIdx.x == 0;
+    long long t_mark = t0, t_rem[3] = {0, 0, 0};
+    int after = 0;   // 1: a set staged to its end (the wait is spare time), 2: an empty set (the wait is the pause)
+    const auto t_add = [&](int k, long long d) {
+        t_rem[k] += d;
+        atomicAdd(a.words + 12 + k, (unsigned) (t_rem[k] >> 6));
+        t_rem[k] &= 63;
+    };
+#pragma unroll 1
+    for (;;) {
+        if (threadIdx.x == 0) {
+            int p;
+            unsigned polls = 0;
+#pragma unroll 1
+            for (;;) {
+                // the count: a device-scope load (the routers' atomicAdd is device scope too; a volatile load would be system scope)
+                p = (int) (__hip_atomic_load(a.words, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) - a.base);
+                if (p > done) break;                       // a fork point ran (p > n: not this window's count)
+                // the stop word, every 64th poll: device scope as well (mall_pf_poke writes it with a kernel of the card; a system-scope load goes
+                // past the card's caches to memory, where a word a kernel wrote need not be yet)
+                if ((++polls & 63u) == 0 && __hip_atomic_load(a.words + 3, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) { p = -1; break; }
+                if (wall_clock64() - t0 > a.timeout) { p = -2; break; }
+                __builtin_amdgcn_s_sleep(8);
+            }
+            next = p;
+            if (tm) {
+                const long long now = wall_clock64();
+                if (after) t_add(after, now - t_mark);
+                t_mark = now;
+            }
+        }
+        __syncthreads();
+        const int p = next;
+        __syncthreads();
+        if (threadIdx.x == 0) {   // what this block did, for the host's report: [5] + [7] + [8] is every set a block has to stage (n - 1 + wrap a window)
+            const bool over = p < 0 || p > a.n;   // stopped, timed out or past its window: the rest of the window's sets are left out
+            const int miss = over ? a.n - 1 - done + a.wrap : p - done - 1;
+            if (miss > 0) atomicAdd(a.words + 7, (unsigned) miss);
+            if (done == 0 && p >= a.n) atomicAdd(a.words + 6, 1u);   // its first sight of the count was the window's end or later
+        }
+        if (p < 0 || p > a.n) {
+            if (threadIdx.x == 0 && p != -1) atomicOr(a.words + 1, p == -2 ? 1u : 2u);
+            break;
+        }
+        const int l = p < a.n ? p : a.wrap ? 0 : -1;
+        if (l >= 0) {
+            const PfSet& s = a.sets[l];
+            bool left = false;
+            size_t staged = 0;   // this block's way into the set, for the report of a set it leaves (every block takes the same pieces)
+            if (!a.gate) {
+                acc ^= pf_touch(s, T, i0);
+            } else {
+                const size_t piece = (size_t) a.gate;
+                unsigned c = 0;
+#pragma unroll 1
+                for (int k = 0; k < s.n && !left; ++k) {
+                    const char* base = reinterpret_cast<const char*>(s.r[k].base);
+                    const size_t bytes = (size_t) s.r[k].bytes;
+#pragma unroll 1
+                    for (size_t o = 0; o < bytes; ++c) {
+                        // has a later event run? thread 0's look, for the block (two slots in turn: the next look's store cannot meet this
+                        // one's loads, as thread 0 passes the next barrier only after every thread has)
+                        if (threadIdx.x == 0) moved[c & 1u] = (int) (__hip_atomic_load(a.words, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) - a.base) != p;
+                        __syncthreads();
+                        if (moved[c & 1u]) {
+                            left = true;
+                            break;
+                        }
+                        size_t len = bytes - o;   // the last piece of a range takes the rest (under two pieces: no piece of a few bytes)
+                        if (len >= 2 * piece) len = piece;
+                        acc ^= pf_touch_range(base + o, len, s.line, s.full, T, i0);
+                        o += len, staged += len;
+                    }
+                }
+            }
+            if (tm) {   // [12] the time in sets with ranges, [15] block 0's position in them when it left, in units of 64 KiB
+                const long long now = wall_clock64();
+                if (s.n) {
+                    size_t all = staged;
+                    if (!a.gate)
+                        for (int k = 0; k < s.n; ++k) all += (size_t) s.r[k].bytes;
+                    t_add(0, now - t_mark);
+                    atomicAdd(a.words + 15, (unsigned) (all >> 16));
+                }
+                after = s.n == 0 ? 2 : left ? 0 : 1;
+                t_mark = now;
+            }
+            if (threadIdx.x == 0) {
+                atomicAdd(a.words + (left ? 8 : 5), 1u);
+                if (!left && s.n == 0) atomicAdd(a.words + 9, 1u);
+                if (left) {   // how far the set was: [10] its staged share in 1/256, [11] what was left cold in units of 256 KiB
+                    size_t all = 0;
+                    for (int k = 0; k < s.n; ++k) all += (size_t) s.r[k].bytes;
+                    atomicAdd(a.words + 10, (unsigned) (all ? staged * 256 / all : 256));
+                    atomicAdd(a.words + 11, (unsigned) ((all - staged) >> 18));
+                }
+            }
+        }
+        if (p == a.n) break;
+        done = p;
+    }
+    if (acc == 0x9e3779b9u) a.words[2] = acc;   // keeps the loads (see k_mall_pf)
+}
+// one of the prefetcher's words for the host, at device scope: out: the word's value to *out; no out: val into the word
+__global__ void k_mall_pf_word(unsigned* w, unsigned val, unsigned* out) {
+    if (out)
+        *out = __hip_atomic_load(w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    else
+        atomicExch(w, val);
+}
+}  // namespace
+bool mall_pf_built() { return true; }
+namespace {
+void pf_check(const PfSet& set, bool need_sink) {
+    if (set.n < 0 || set.n > MALL_PF_MAXR || set.line < 4 || (need_sink && !set.sink)) throw std::runtime_error("mall_pf: a bad set");
+    for (int k = 0; k < set.n; ++k)
+        if (!set.r[k].base || set.r[k].bytes < 16) throw std::runtime_error("mall_pf: a range under 16 bytes");
+}
+}  // namespace
+void mall_pf(const PfSet& set, int wgs, void* st) {
+    if (wgs < 1 || wgs > 1024) throw std::runtime_error("mall_pf: 1..1024 workgroups");   // (the engine's own limit is 64; kbench stages with up to a full grid)
+    pf_check(set, true);
+    k_mall_pf<<<(unsigned) wgs, 256, 0, (cudaStream_t) st>>>(set);
+    ck_launch("mall_pf");
+}
+void mall_pf_table(PfSet* dev_table, const PfSet* sets, int n) {
+    if (!dev_table || !sets || n < 1) throw std::runtime_error("mall_pf_table: no table");
+    for (int i = 0; i < n; ++i) pf_check(sets[i], false);
+    const cudaError_t e = cudaMemcpy(dev_table, sets, (size_t) n * sizeof(PfSet), cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) throw std::runtime_error(std::string("mall_pf_table: ") + cudaGetErrorString(e));
+}
+void mall_pf_run(const PfRun& r, int wgs, void* st, bool query) {
+    if (!r.sets || !r.words || r.n < 1 || wgs < 1 || wgs > 64 || r.timeout <= 0) throw std::runtime_error("mall_pf_run: a bad table, grid or time-out");
+    if (r.gate && (r.gate < 65536 || r.gate % 4096)) throw std::runtime_error("mall_pf_run: the gate's piece is a multiple of 4096 bytes, 65536 or more");
+    k_mall_pf_run<<<(unsigned) wgs, 256, 0, (cudaStream_t) st>>>(r);
+    ck_launch("mall_pf_run");
+    if (query) {   // (ROCm 7.2.4 clr: Command::enqueue writes the AQL packet and the doorbell in the launch call: nothing is left to flush)
+        const cudaError_t q = cudaStreamQuery((cudaStream_t) st);   // "not ready" is the expected answer (it does not set the last error)
+        if (q != cudaSuccess && q != cudaErrorNotReady) throw std::runtime_error(std::string("mall_pf_run: stream query: ") + cudaGetErrorString(q));
+    }
+}
+void* mall_pf_stream(int prio, bool* own_queue) {
+    hipStream_t s = nullptr;
+    bool own = false;
+    if (prio) {
+        int least = 0, greatest = 0;
+        if (hipDeviceGetStreamPriorityRange(&least, &greatest) == hipSuccess && least != greatest)
+            own = hipStreamCreateWithPriority(&s, hipStreamNonBlocking, prio > 0 ? greatest : least) == hipSuccess && s != nullptr;
+        if (!own) {
+            s = nullptr;
+            (void) hipGetLastError();   // the failed call's error only
+        }
+    }
+    if (!s && hipStreamCreateWithFlags(&s, hipStreamNonBlocking) != hipSuccess) throw std::runtime_error("mall_pf_stream: no stream");
+    if (own_queue) *own_queue = own;
+    return s;
+}
+void mall_pf_poke(unsigned* words, int idx, unsigned val, void* st) {
+    if (!words || idx < 0 || idx >= MALL_PF_WORDS) throw std::runtime_error("mall_pf_poke: a bad word");
+    k_mall_pf_word<<<1, 1, 0, (cudaStream_t) st>>>(words + idx, val, nullptr);
+    ck_launch("mall_pf_poke");
+}
+void mall_pf_peek(const unsigned* words, int idx, unsigned* dev_out, void* st) {
+    if (!words || !dev_out || idx < 0 || idx >= MALL_PF_WORDS) throw std::runtime_error("mall_pf_peek: a bad word");
+    k_mall_pf_word<<<1, 1, 0, (cudaStream_t) st>>>(const_cast<unsigned*>(words) + idx, 0u, dev_out);
+    ck_launch("mall_pf_peek");
+}
+long long mall_pf_ticks(double ms) {
+    int dev = 0, khz = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || khz <= 0) {
+        cudaGetLastError();
+        khz = 100000;   // gfx11 and later: 100 MHz
+    }
+    return (long long) (ms * (double) khz);
+}
+#else
+bool mall_pf_built() { return false; }
+void mall_pf(const PfSet&, int, void*) { throw std::runtime_error("mall_pf: built without STRATA_SPLIT_FAST"); }
+void mall_pf_run(const PfRun&, int, void*, bool) { throw std::runtime_error("mall_pf_run: built without STRATA_SPLIT_FAST"); }
+void* mall_pf_stream(int, bool*) { throw std::runtime_error("mall_pf_stream: built without STRATA_SPLIT_FAST"); }
+void mall_pf_poke(unsigned*, int, unsigned, void*) { throw std::runtime_error("mall_pf_poke: built without STRATA_SPLIT_FAST"); }
+void mall_pf_peek(const unsigned*, int, unsigned*, void*) { throw std::runtime_error("mall_pf_peek: built without STRATA_SPLIT_FAST"); }
+void mall_pf_table(PfSet*, const PfSet*, int) { throw std::runtime_error("mall_pf_table: built without STRATA_SPLIT_FAST"); }
+long long mall_pf_ticks(double) { return 0; }
+#endif
 }  // namespace fnx
 
 namespace fnx {

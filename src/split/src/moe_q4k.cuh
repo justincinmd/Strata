@@ -4,7 +4,17 @@
 // d8 * (sc * dot(q, a)) and d8 * (m * sum(a)) on the quantized activations, then d * . - dmin * .
 namespace {
 
-constexpr int Q4K_THREADS = 256, Q4K_LPR = 8, Q4K_ROWS = Q4K_THREADS / Q4K_LPR;
+// generator parameters (gen/families.py moe_gu_q4k; the defaults are the kernel in the binary): the lanes a row (a power of two that divides the row's
+// 40 groups: 2, 4, 8) and the passes a lane's groups are loaded in (1: all at once, 2: two halves, 0: a group at a time)
+#ifndef FNX_TK_Q4K_LPR
+#define FNX_TK_Q4K_LPR 8
+#endif
+#ifndef FNX_TK_Q4K_PASSES
+#define FNX_TK_Q4K_PASSES 2
+#endif
+constexpr int Q4K_THREADS = 256, Q4K_LPR = FNX_TK_Q4K_LPR, Q4K_ROWS = Q4K_THREADS / Q4K_LPR;
+static_assert(Q4K_LPR == 2 || Q4K_LPR == 4 || Q4K_LPR == 8, "FNX_TK_Q4K_LPR: 2, 4 or 8 lanes a row (job_store's xor reduction, whole rows a block)");
+static_assert(FNX_TK_Q4K_PASSES >= 0 && FNX_TK_Q4K_PASSES <= 2, "FNX_TK_Q4K_PASSES: 0, 1 or 2");
 
 // byte k (0..11) of the 12 scale bytes held in the header words y, z, w
 __device__ __forceinline__ unsigned q4k_sbyte(const uint4& h, int k) {
@@ -36,9 +46,9 @@ __device__ __forceinline__ void q4k_groups(const char* wrow, int lane8, int n, c
     for (int ii = 0; ii < G; ++ii) {
         const int g = lane8 + (I0 + ii) * Q4K_LPR, b = g >> 2, jg = g & 3;
         const char* blk = wrow + (size_t) b * 144;
-        hdr[ii] = __ldg(reinterpret_cast<const uint4*>(blk));
-        q0[ii] = __ldg(reinterpret_cast<const uint4*>(blk + 16 + 32 * jg));
-        q1[ii] = __ldg(reinterpret_cast<const uint4*>(blk + 32 + 32 * jg));
+        hdr[ii] = FNX_WLD1(reinterpret_cast<const uint4*>(blk));
+        q0[ii] = FNX_WLD1(reinterpret_cast<const uint4*>(blk + 16 + 32 * jg));
+        q1[ii] = FNX_WLD1(reinterpret_cast<const uint4*>(blk + 32 + 32 * jg));
     }
 #pragma unroll
     for (int ii = 0; ii < G; ++ii) {
@@ -76,13 +86,28 @@ __device__ __forceinline__ void q4k_groups(const char* wrow, int lane8, int n, c
 
 // the lane's groups in two passes, the second's loads after the first's dots (a compiler barrier between): all five
 // held at once took the registers of 3 blocks an SM. Each token's sum takes the groups in the same order
+#if FNX_TK_Q4K_PASSES == 0   // (generator) a group at a time
+template <int I> __device__ __forceinline__ void q4k_each(const char* wrow, int lane8, int n, const block_q8_1* y, const int* ys, int y_stride, float* tmp) {
+    if constexpr (I < Q4K_GPL) {
+        q4k_groups<I, I + 1>(wrow, lane8, n, y, ys, y_stride, tmp);
+        asm volatile("" ::: "memory");
+        q4k_each<I + 1>(wrow, lane8, n, y, ys, y_stride, tmp);
+    }
+}
+#endif
 template <int TT>
 __device__ __forceinline__ void q4k_row(const char* wrow, int lane8, int n, const block_q8_1* y, const int* ys, int y_stride,
                                         float* tmp) {
+#if FNX_TK_Q4K_PASSES == 2
     constexpr int SPLIT = (Q4K_GPL + 1) / 2;
     q4k_groups<0, SPLIT>(wrow, lane8, n, y, ys, y_stride, tmp);
     asm volatile("" ::: "memory");
     q4k_groups<SPLIT, Q4K_GPL>(wrow, lane8, n, y, ys, y_stride, tmp);
+#elif FNX_TK_Q4K_PASSES == 1
+    q4k_groups<0, Q4K_GPL>(wrow, lane8, n, y, ys, y_stride, tmp);
+#else
+    q4k_each<0>(wrow, lane8, n, y, ys, y_stride, tmp);
+#endif
 }
 
 // sd.rows: the launch's first sd_rows rows of blocks make the shared expert's swiglu and down, a q8s block or two each
@@ -129,9 +154,17 @@ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k_big(MoeW w, const Bi
 void gu_q4k_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const block_q8_1* y, float* out,
                    cudaStream_t s, const ShexpDown& sd = ShexpDown{}) {
     if (w.ncols != N || w.row_a != (size_t) N / 256 * 144) throw std::runtime_error("moe gate|up q4_K: row layout");
-    const int gx = (w.nrows + Q4K_ROWS - 1) / Q4K_ROWS, sd_blocks = (sd.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+    static const tk::Family* const tkf = tk::family("moe_gu_q4k");   // the generator's variant: a kernel per row count; meta[0] its rows a block
+    const int rows_blk = tkf ? tkf->kern(T).meta[0] : Q4K_ROWS;
+    if (rows_blk < 1 || rows_blk > Q4K_THREADS) throw std::runtime_error("moe gate|up q4_K: the variant's rows a block");
+    const int gx = (w.nrows + rows_blk - 1) / rows_blk, sd_blocks = (sd.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
     const int sd_rows = sd.rows ? (sd_blocks + gx - 1) / gx : 0;
     const dim3 grid(gx, njobs_max + sd_rows);
+    if (tkf) {
+        const tk::Kern& k = tkf->kern(T);
+        FNX_TK_LAUNCH(k, k_moe_gu_q4k<1>, grid, dim3(k.threads), 0, s, w, jobs, njobs, y, out, sd, sd_rows);
+        return;
+    }
     switch (T) {
         case 1: k_moe_gu_q4k<1><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
         case 2: k_moe_gu_q4k<2><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;

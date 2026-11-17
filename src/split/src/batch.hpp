@@ -54,6 +54,7 @@ public:
     // the last window's wall time, its verify_rows' share and its drafting's (the draft layer's calls for the next window)
     double last_ms = 0.0, last_verify_ms = 0.0, last_draft_ms = 0.0;
     int last_rows = 0, last_calls = 0;
+    double last_call_ms = 0.0, last_call_gpu_ms = 0.0;   // FNX_BATCH_STATS: the window's draft-layer calls: the engine's time in them, the cards' own
 
 private:
     Engine& e_;

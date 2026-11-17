@@ -297,9 +297,33 @@ constexpr size_t mm_smem() { return std::max(sizeof(__half) * (BM + PF_JOB) * MM
 // from shared memory feeds TT or 2 products): warp w takes rows 32 (w % WR) and tokens (64 / WT) (w / WR). A job of at
 // most TT token tiles runs on every warp anyway: the WT warps of a row group then take every WT-th 16 columns of each
 // k-step, summed at the end.
-template <int TYPE, int BM>
+#ifdef FNX_MM_ATTR
+// tools/moe_mma_test.cu only (attribution): bit 1 no WMMA, 2 no weight put (dequant + LDS store), 4 no weight fetch, 8 no activation
+// fetch / put, 16 no output store
+__constant__ int mm_skip;
+#define MM_SKIP(b) (mm_skip & (b))
+#else
+#define MM_SKIP(b) 0
+#endif
+__device__ __forceinline__ void mm_store(float* p, float v) { *p = v; }
+// FNX_PF_PART16: the prompt down rows, saturated at the f16 range (an unweighted slot past 65504 would otherwise become inf;
+// in-range values round as before, NaN stays NaN and the ring's range check still sees it)
+__device__ __forceinline__ void mm_store(__half* p, float v) { *p = __float2half_rn(v != v ? v : fminf(fmaxf(v, -65504.f), 65504.f)); }
+// DIRECT (FNX_PF_MM_DIRECT=1, gfx12): a job that is not k-split stores its outputs from the accumulators (lane l: token l & 15, 8
+// consecutive rows = one 16- or 32-byte store), with no staging through shared memory; the same values as the staged path
+__device__ __forceinline__ void mm_out8(float* p, const float (&v)[8]) {
+    reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
+    reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
+}
+__device__ __forceinline__ void mm_out8(__half* p, const float (&v)[8]) {
+    __align__(16) __half h[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) h[j] = __float2half_rn(v[j] != v[j] ? v[j] : fminf(fmaxf(v[j], -65504.f), 65504.f));
+    *reinterpret_cast<uint4*>(p) = *reinterpret_cast<const uint4*>(h);
+}
+template <int TYPE, int BM, typename OutT = float, bool DIRECT = false>
 __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
-                                                        const __half* __restrict__ x, int ldx, float* __restrict__ out) {
+                                                        const __half* __restrict__ x, int ldx, OutT* __restrict__ out) {
     using namespace nvcuda;
     constexpr int MM_NT = PF_JOB / 16;   // token tiles of a job
     constexpr int WR = BM / 32, WT = MM_THREADS / 32 / WR, TT = MM_NT / WT, NP = BM / MM_PASS, LO = 16 * TT;
@@ -367,21 +391,21 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
     MmX xt;
     xt.rows(jb, nt);
 #pragma unroll
-    for (int p = 0; p < NP; ++p) wt[p].fetch(we, w.row_a, w.nrows, row0 + p * MM_PASS, 0, min(MM_KC, w.ncols));
-    xt.fetch(x, ldx, 0, min(MM_KC, w.ncols));
+    for (int p = 0; p < NP; ++p) if (!MM_SKIP(4)) wt[p].fetch(we, w.row_a, w.nrows, row0 + p * MM_PASS, 0, min(MM_KC, w.ncols));
+    if (!MM_SKIP(8)) xt.fetch(x, ldx, 0, min(MM_KC, w.ncols));
     for (int k0 = 0; k0 < w.ncols; k0 += MM_KC) {
         const int kc = min(MM_KC, w.ncols - k0);
 #pragma unroll
-        for (int p = 0; p < NP; ++p) wt[p].put(k0, kc, sw + p * MM_PASS * MM_LD);
-        xt.put(kc, sx);
+        for (int p = 0; p < NP; ++p) if (!MM_SKIP(2)) wt[p].put(k0, kc, sw + p * MM_PASS * MM_LD);
+        if (!MM_SKIP(8)) xt.put(kc, sx);
         __syncthreads();
         if (k0 + MM_KC < w.ncols) {
             const int kn = min(MM_KC, w.ncols - k0 - MM_KC);
 #pragma unroll
-            for (int p = 0; p < NP; ++p) wt[p].fetch(we, w.row_a, w.nrows, row0 + p * MM_PASS, k0 + MM_KC, kn);
-            xt.fetch(x, ldx, k0 + MM_KC, kn);
+            for (int p = 0; p < NP; ++p) if (!MM_SKIP(4)) wt[p].fetch(we, w.row_a, w.nrows, row0 + p * MM_PASS, k0 + MM_KC, kn);
+            if (!MM_SKIP(8)) xt.fetch(x, ldx, k0 + MM_KC, kn);
         }
-        if (tb < nt) {
+        if (tb < nt && !MM_SKIP(1)) {
             const int kt0 = split ? tg : 0, kts = split ? WT : 1;
 #pragma unroll
             for (int i = 0; i < MM_KC / 16; ++i) {
@@ -443,6 +467,27 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
         }
         __syncthreads();
     }
+#if FNX_HIP && !FNX_WMMA_GFX11
+    if constexpr (DIRECT) {
+        if (!split) {   // block-uniform; the k-loop's last barrier is behind every warp
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int row = row0 + rg * 32 + r * 16 + 8 * lh;
+                if (row + 8 > w.nrows) continue;   // nrows is a multiple of 8 on every launch that sets DIRECT (checked by the launcher)
+#pragma unroll
+                for (int t = 0; t < TT; ++t) {
+                    const int j = (tb + t) * 16 + ln;
+                    if (j >= n) continue;
+                    float v[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) v[i] = acc[r][t][i];
+                    if (!MM_SKIP(16)) mm_out8(out + (size_t) jb.out[j] * w.nrows + row, v);
+                }
+            }
+            return;
+        }
+    }
+#endif
     // the output through shared memory over the tiles, token-major [token][row] with rows padded to MM_SLD<BM> floats,
     // so the read back below takes consecutive rows; a split's partial sums are one such [LO][row] block per tg
     float* so = reinterpret_cast<float*>(smem);
@@ -493,7 +538,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
 #pragma unroll
             for (int g = 1; g < WT; ++g) v += so[g * LO * SLD + j * SLD + r];
         }
-        out[(size_t) jb.out[j] * w.nrows + row] = v;
+        if (!MM_SKIP(16)) mm_store(out + (size_t) jb.out[j] * w.nrows + row, v);
     }
 }
 

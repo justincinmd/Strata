@@ -177,6 +177,11 @@ __device__ __forceinline__ float gch_exp(float x) { return (float) exp((double) 
 constexpr int GCH_PREP_FLOATS = 2 * GCH * GCH + 3 * GCH + 1;   // per sub-chunk and head: T, P, G, decay to end, b, G_last
 static_assert(GCR_THREADS == GCH * GCB / 8 * 2 && GCR_THREADS == HS / 4 * (GCB / 4), "k_gdn_ch_rec's thread tiles");
 
+// MMF (FNX_PF_GDN_MM, gdn_mm_prompt.cuh): T and P as k_gdn_ch_rec_mm's A operands, tiles (0,0) (1,0) (1,1) of 16 x 16, a lane's
+// 8 values together ([tile][lane][8]: row 16 mt + (lane & 15), columns 16 js + 8 (lane >> 4) + 0..7), then the scalars as above,
+// GMM_PREP_FLOATS a record (16-B aligned)
+constexpr int GMM_PREP_FLOATS = 2 * 3 * 256 + 3 * GCH + 4;
+template <bool MMF = false, int PSKIP = 0>   // PSKIP 1 (timing only): no T solve
 __global__ void __launch_bounds__(GCH_THREADS) k_gdn_ch_prep(const float* __restrict__ xc, const float* __restrict__ ab,
                                                             const float* __restrict__ dt, const float* __restrict__ a,
                                                             const int* __restrict__ vmap, int nk, int nv, int C,
@@ -228,27 +233,44 @@ __global__ void __launch_bounds__(GCH_THREADS) k_gdn_ch_prep(const float* __rest
     }
     __syncthreads();
     // T = (I + A)^{-1}, lower unit-triangular: row i = e_i - sum_{j<i} A_ij row j (a warp, a column each)
-    if (tid < GCH) {
+    // (column m in registers, the loops unrolled, the terms j < m left out by a select: the row-by-row substitution's own sums,
+    // bit for bit; it was 0.31 of 0.54 ms at C 4096 through shared memory)
+    if (!(PSKIP & 1) && tid < GCH) {
         const int m = tid;
+        float tc[GCH];
+#pragma unroll
         for (int i = 0; i < GCH; ++i) {
             float v = i == m ? 1.f : 0.f;
-            for (int j = m; j < i; ++j) v = fmaf(-kk[i][j], tt[j][m], v);
-            tt[i][m] = m <= i ? v : 0.f;
-            __syncwarp();
+#pragma unroll
+            for (int j = 0; j < i; ++j) v = j >= m ? fmaf(-kk[i][j], tc[j], v) : v;   // the old loop's terms only (NaN / inf too)
+            tc[i] = m <= i ? v : 0.f;
         }
+#pragma unroll
+        for (int i = 0; i < GCH; ++i) tt[i][m] = tc[i];
     }
     __syncthreads();
-    float* o = out + ((size_t) sc * nv + lv) * GCH_PREP_FLOATS;
-    for (int e = tid; e < GCH * GCH; e += GCH_THREADS) {
-        o[e] = tt[e / GCH][e % GCH];
-        o[GCH * GCH + e] = pp[e / GCH][e % GCH];
+    float* o = out + ((size_t) sc * nv + lv) * (MMF ? GMM_PREP_FLOATS : GCH_PREP_FLOATS);
+    int so = 2 * GCH * GCH;   // the scalars' offset
+    if (MMF) {
+        for (int e = tid; e < 3 * 256; e += GCH_THREADS) {
+            const int x = e / 256, l = (e / 8) % 32, i = e % 8, r = 16 * (x > 0) + (l & 15), c = 16 * (x > 1) + 8 * (l >> 4) + i;
+            o[e] = tt[r][c];
+            o[3 * 256 + e] = pp[r][c];
+        }
+        so = 2 * 3 * 256;
+    } else {
+        for (int e = tid; e < GCH * GCH; e += GCH_THREADS) {
+            o[e] = tt[e / GCH][e % GCH];
+            o[GCH * GCH + e] = pp[e / GCH][e % GCH];
+        }
     }
     if (tid < GCH) {
-        o[2 * GCH * GCH + tid] = gch_exp(lgam[tid]);
-        o[2 * GCH * GCH + GCH + tid] = gch_exp(lgam[GCH - 1] - lgam[tid]);
-        o[2 * GCH * GCH + 2 * GCH + tid] = bb[tid];
+        o[so + tid] = gch_exp(lgam[tid]);
+        o[so + GCH + tid] = gch_exp(lgam[GCH - 1] - lgam[tid]);
+        o[so + 2 * GCH + tid] = bb[tid];
     }
-    if (tid == 0) o[2 * GCH * GCH + 3 * GCH] = gch_exp(lgam[GCH - 1]);
+    if (tid == 0) o[so + 3 * GCH] = gch_exp(lgam[GCH - 1]);
+    if (MMF && tid < GMM_PREP_FLOATS - (2 * 3 * 256 + 3 * GCH + 1)) o[2 * 3 * 256 + 3 * GCH + 1 + tid] = 0.f;   // the record's padding
 }
 
 constexpr size_t GCH_REC_SMEM = sizeof(float) * (2 * GCH * (HS + 1) + HS * GCB + 4 * GCH * GCB + GCH_PREP_FLOATS);
