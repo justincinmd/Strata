@@ -1249,7 +1249,8 @@ void load_dflash2(fnx::df2::Bridge& br, const fnx::Model& m, const Args& a) {
 int main(int argc, char** argv) {
 #if FNX_HIP
     // before the first HIP call: the runtime's compute queues a card stay inside the card's hardware slots (src/hip/queue_budget.hpp)
-    const fnx::QueueBudget qb = fnx::queue_budget_apply("/sys/class/kfd/kfd", fnx::FAST);   // (a default build leaves the runtime's own number)
+    // (a build without STRATA_SPLIT_FAST reads no KFD file here and leaves the runtime's own number)
+    const fnx::QueueBudget qb = fnx::FAST ? fnx::queue_budget_apply("/sys/class/kfd/kfd") : fnx::QueueBudget{};
     if (!qb.line.empty()) std::fprintf(stderr, "sfnx: %s\n", qb.line.c_str());
 #endif
     Args a;
@@ -1298,7 +1299,7 @@ int main(int argc, char** argv) {
 #endif
 #if FNX_HIP
         // (queues are made as streams are first used: the count after the first request is the run's)
-        if (const std::string ql = fnx::queue_count_line("/sys/class/kfd/kfd", (long) getpid()); !ql.empty())
+        if (const std::string ql = fnx::FAST ? fnx::queue_count_line("/sys/class/kfd/kfd", (long) getpid()) : std::string(); !ql.empty())
             std::fprintf(stderr, "sfnx: compute queues / hardware slots at load: %s; GPU_MAX_HW_QUEUES=%d\n", ql.c_str(), qb.value);
 #endif
         if (fnx::NCARD > 3)

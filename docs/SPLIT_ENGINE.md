@@ -90,8 +90,8 @@ Two CMake options add faster paths for gfx1201. A build without them answers as 
   queues the prompt path's launches, its expert products are written straight from the accumulators, and a layer's dense matrices stay as f16 between its chunks;
   the hc read's and the window sum's grids are sized for an R9700; a draft call's copies are packed and its wait is on its last event; the many-user windows take the
   one-user window's builder; a checkpoint's host memory is reused; a wait that reaches its time-out begins again while the driver holds the process's queues off the
-  card; and the engine holds the HIP runtime to the card's hardware compute queue slots (it sets `GPU_MAX_HW_QUEUES` when the variable is not set: with more queues
-  than slots the prompt reads lose 14 % after the first decode).
+  card (a host thread reads KFD's evicted_ms files of the process; a build without the option starts no such thread); and the engine sets `GPU_MAX_HW_QUEUES` to the card's hardware compute queue slots less one when the variable is not set (3 on an R9700: 5 queues a card in
+  place of the runtime's 6; with 6 the prompt reads lose 14 % after the first decode).
 - **`-DSTRATA_SPLIT_APPROX=ON`** (`APPROX=1`; needs FAST; `STRATA_SPLIT_CARDS=4` only): the paths that change the output's last bits, as the copy-engine ring does
   against the GPU-thread ring. The attention is split by heads (a card attends every position for its own query heads); the decode attention runs as f16 matrix products
   over the K/V cache's int8 codes, and the hc read on the int8 matrix instruction; the values that go between the cards in the prompt path are f16, and a chunk's hc read is split over the cards; a text segment

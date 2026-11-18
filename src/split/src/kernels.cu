@@ -1834,8 +1834,8 @@ bool att_mm_on() {
 // that attn_part_lanes and attn_finish agree, and pages of the other kind than kv_q8 says are refused (att_mm_pages)
 bool att_mm_attn() { return att_mm_on() && kv_q8(); }
 // its splits of a row: FNX_ATT_MM_SPLITS (default 8), the same for every window, so that a row's sums do not depend on the other rows of its
-// window: a sequence's greedy text is then the same alone and in a batch (2026-11-14: with the count by the rows, 4..16, the 4-user texts of
-// agree.py differed from the 1-user texts; 8 and 16 give equal texts, and 8 costs the least over 1..16 rows). 0: by the rows (about a block a
+// window: a sequence's greedy text is then the same alone and in a batch (2026-11-14: with the count by the rows, 4..16, the 4-user greedy
+// texts differed from the 1-user texts; 8 and 16 give equal texts, and 8 costs the least over 1..16 rows). 0: by the rows (about a block a
 // compute unit; up to 5 us a layer faster under 5 rows, but batch-dependent sums)
 int att_mm_splits(int T) {
     static const long long env = env_int("FNX_ATT_MM_SPLITS", std::min(8, ATT_SPLITS));   // (ATT_SPLITS: the partials' slots a head; a build with fewer than 8 takes them all)

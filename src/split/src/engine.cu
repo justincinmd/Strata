@@ -510,8 +510,9 @@ void Engine::diag_load(int c, CardBuf& b) {
     // queues a moment ago (diag.cuh diag_wait_on). 0: off, a wait fails at its time-out as before the watch
     // (FNX_WAIT_JUMP_CYCLES=0 is read as the same). Off too when the watch cannot run (no KFD files for this process)
     static const bool ext = env_int("FNX_WAIT_EVICT", FAST) != 0 && env_int("FNX_WAIT_JUMP_CYCLES", 1) != 0;
-    const unsigned long long* word = evict_watch_word();   // the watch runs either way: its numbers go into the log and the report
-    const unsigned long long* watch = ext ? word : nullptr;
+    // the watch (a host thread that reads KFD's evicted_ms files) starts only when the waits use it: a build without STRATA_SPLIT_FAST starts none
+    const unsigned long long* word = ext ? evict_watch_word() : nullptr;
+    const unsigned long long* watch = word;
     diag_ext_on_ = watch != nullptr;
     const unsigned watch_w[2] = {(unsigned) (uintptr_t) watch, (unsigned) ((unsigned long long) (uintptr_t) watch >> 32)};
     ck(cudaMemcpy(b.ring.err + DG_WATCH_LO, watch_w, sizeof watch_w, cudaMemcpyHostToDevice), "watch word");
@@ -528,8 +529,7 @@ void Engine::diag_load(int c, CardBuf& b) {
                                  "more, once, then fails; a wait extended by %lld cycles fails at its next time-out (FNX_WAIT_EVICT=0: off)\n",
                          WAIT_EVICT_WINDOW_MS, evict_watch_stats().files, WAIT_GRACE_CYCLES, WAIT_EXT_CAP);
         else if (!ext)
-            std::fprintf(stderr, "fnx: diag: FNX_WAIT_EVICT=0: a wait fails at its time-out (a driver eviction can fail a window); the eviction watch %s\n",
-                         word ? "runs for the log" : "does not run (no KFD evicted_ms file of this process, or no host page)");
+            std::fprintf(stderr, "fnx: diag: FNX_WAIT_EVICT off: a wait fails at its time-out (a driver eviction can fail a window); no eviction watch\n");
         else std::fprintf(stderr, "fnx: diag: no eviction watch (no KFD evicted_ms file of this process, or no host page): a wait fails at its time-out\n");
     }
     const bool set = cycles > 0 || ms > 0;

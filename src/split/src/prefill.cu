@@ -824,7 +824,7 @@ __global__ void k_sg16_check(const float* __restrict__ W, int cols, unsigned* __
 // out = W . x, f32 weights [rows][cols] and activations.
 // FNX_PF_SG16 (on in an APPROX build; 0: cublasSgemm for all): the router and the indexer projections of a layer whose weights pass pf_sg16_check go through
 // the f16 tensor-core GEMM: W as f16, x in two f16 terms, fp32 accumulation, the second product added to the first. The f16 x f16 products are
-// exact in fp32, so the result is an fp32 sum of the same class as sgemm's (sg16_bench, 513 x 2560 x 4096 rows against a double sum: sgemm mean
+// exact in fp32, so the result is an fp32 sum of the same class as sgemm's (a host check of 513 x 2560 x 4096 rows against a double sum: sgemm mean
 // 3.5e-6 / max 4.5e-5, this 6.2e-6 / 7.7e-5 at logits of 4.5; one term alone 9e-4; a third term changed nothing there) at 9 to 11 times the
 // speed (3.28 -> 0.37 ms; rocBLAS's sgemm runs at 3 TFLOPS here). What the f16 weights lose is not recovered by x's terms: the check bounds it
 // a row (SG16_W_ERR, the row's sum of |w - f16(w)|, itself an fp32 sum, so good to a few ulps: an output is off by about that times the largest |x| at most), and a matrix over the bound, with
